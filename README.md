@@ -28,6 +28,8 @@
 
 ---
 
+> **Fork Notice:** This repository (`rruda3/clips`) is a customized fork of [**SupoClip**](https://github.com/FujiwaraChoki/supoclip), originally created by [**FujiwaraChoki**](https://github.com/FujiwaraChoki). All original core architecture, pipeline, and credit belong to the upstream project and its contributors.
+
 SupoClip is an open-source, AI-powered video clipping tool. Give it a long video — a podcast, a talk, a stream VOD — and it finds the most viral-worthy moments, scores them, and renders them as vertical 9:16 clips with face-centered cropping, word-synced subtitles, hook titles, and optional B-roll. Run it yourself, customize it, inspect it — or use the hosted version and skip the setup.
 
 **See it first:** [watch real clips SupoClip generated](https://www.supoclip.com/demo) from a long-form interview, or follow the [self-hosting tutorial](https://www.supoclip.com/blog/self-host-supoclip-docker) to run it on your own machine.
@@ -68,13 +70,23 @@ SupoClip gives you the same core pipeline without the leash:
 - **Performance loop** — views, likes, comments and shares flow back from each platform and steer future clip selection toward what works for your audience
 - **Real-time progress** — live pipeline updates streamed to the browser while your video processes
 
+## What's New in This Fork
+
+- **TikTok Studio (`/tiktok-studio`)** — open any video with generated clips and enhance individual cuts in **1-click automatic mode** or **hybrid copilot mode** across `9:16`, `1:1`, and `16:9` formats:
+  - Split webcam + gameplay framing, black-and-white freeze-frame fail moments, explosion hard cuts, punch zooms, screen shake, comic subtexts, reaction sound effects, and background music with auto-ducking.
+  - Visual **quick-cut bar** with interactive audio waveform scrubbing, one-click split, trim start/end, A→B middle-section removal, part deletion, and seamless switching back and forth with the full timeline editor while keeping saved edits.
+  - Live summary of all applied effects, layouts, captions, cuts, music, and SFX.
+- **Gameplay Viral Detection** — gameplay mode on the create screen scans audio peaks, screams, explosions, and visual motion so cuts capture the setup, chaos, and reaction instead of relying on speech alone.
+- **Video Cache Manager (`/cache`)** — sidebar tab listing cached YouTube and uploaded source videos with their disk sizes, allowing individual deletion or clearing unused cache to free storage space.
+- **LLM & Whisper Resilience** — support for `LLM_FALLBACK_MODELS`, rate-limit pacing (`LLM_MAX_RPM`, `LLM_MIN_INTERVAL_SECONDS`), configurable transcript windowing (`ANALYSIS_WINDOW_CONCURRENCY`, `ANALYSIS_WINDOW_SECONDS`, `ANALYSIS_SINGLE_WINDOW_MAX_SECONDS`), remote Whisper HTTP transcription (`WHISPER_SERVER_URL`), and expanded self-hosted limits.
+
 ## Quick Start
 
 You need Docker, an [AssemblyAI](https://www.assemblyai.com/) API key for transcription, and one LLM provider key (Google, OpenAI, Anthropic, or a local Ollama).
 
 ```bash
-git clone https://github.com/FujiwaraChoki/supoclip.git
-cd supoclip
+git clone https://github.com/rruda3/clips.git
+cd clips
 ```
 
 Create a `.env` in the root with your keys:
@@ -118,6 +130,11 @@ The stack runs locally without Docker too — see [development](docs/development
 ```bash
 make test
 ```
+
+## Credits & Upstream
+
+- **Original Project:** [SupoClip](https://github.com/FujiwaraChoki/supoclip) created by [**FujiwaraChoki**](https://github.com/FujiwaraChoki) and contributors.
+- **Fork Maintainer:** [rruda3](https://github.com/rruda3) — TikTok Studio, gameplay signal detection, video cache manager, and self-hosted LLM/Whisper enhancements.
 
 ## License
 
