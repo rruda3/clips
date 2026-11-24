@@ -194,5 +194,6 @@ def test_export_with_fractional_fps_and_stock_has_no_extra_tail_frames(tmp_path)
     doc = EditDocument(segments=[{"id": "s", "start": 0, "end": 8}], framing={"aspect": "original"}, broll=[{"id": "b", "start": 4.97, "end": 7.97, "offset": 0, "query": "blue", "footage": footage}])
     render_document(tmp_path, "fractional", doc, "tiktok", {doc.broll[0].footage.key: stock})
     info = json.loads(subprocess.check_output(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_streams", "-of", "json", str(tmp_path / "export-fractional.mp4")]))["streams"][0]
-    assert int(info["nb_frames"]) == 240
+    assert int(info["nb_frames"]) == 480
+    assert info["r_frame_rate"] == "60/1"
     assert float(info["duration"]) == pytest.approx(8, abs=.035)

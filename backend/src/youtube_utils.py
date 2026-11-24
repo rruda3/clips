@@ -896,7 +896,7 @@ def get_video_duration(url: str) -> Optional[int]:
 
 
 def is_video_suitable_for_processing(
-    url: str, min_duration: int = 60, max_duration: int = 7200
+    url: str, min_duration: int = 60, max_duration: int = 14400
 ) -> bool:
     """
     Check if video is suitable for processing based on duration and other factors.

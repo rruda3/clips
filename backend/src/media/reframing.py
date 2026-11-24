@@ -1437,6 +1437,31 @@ def _described(
     }
 
 
+def build_gameplay_split_layout(
+    width: int,
+    height: int,
+    webcam_box: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Compose a 9:16 gameplay split: webcam crop on top 1/3 (1080x640), game on bottom 2/3 (1080x1280)."""
+    wb = webcam_box or {}
+    cx = max(0, min(width - 4, round_to_even(int(round(width * float(wb.get("x", 0.02)))))))
+    cy = max(0, min(height - 4, round_to_even(int(round(height * float(wb.get("y", 0.03)))))))
+    cw = max(4, min(width - cx, round_to_even(int(round(width * float(wb.get("w", 0.26)))))))
+    ch = max(4, min(height - cy, round_to_even(int(round(height * float(wb.get("h", 0.28)))))))
+    top_h = 640
+    bot_h = 1280
+    vf = (
+        f"[0:v]split=2[vcam_in][vgame_in];"
+        f"[vcam_in]crop={cw}:{ch}:{cx}:{cy},"
+        f"scale=1080:{top_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+        f"crop=1080:{top_h},setsar=1[vcam_top];"
+        f"[vgame_in]scale=1080:{bot_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+        f"crop=1080:{bot_h},setsar=1[vgame_bot];"
+        f"[vcam_top][vgame_bot]vstack=inputs=2,setsar=1[vout]"
+    )
+    return _described("gameplay_split", vf, "complex", 0.78)
+
+
 def build_vertical_filter_plan(
     input_path: Path,
     width: int,
@@ -1444,6 +1469,9 @@ def build_vertical_filter_plan(
     speaker_turns: Optional[List[Dict[str, Any]]] = None,
     speaker_words: Optional[List[Dict[str, Any]]] = None,
     report: Optional[Dict[str, Any]] = None,
+    *,
+    gameplay_mode: bool = False,
+    gameplay_webcam_box: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str, Optional[float]]:
     """Build the 9:16 reframing filter for the default vertical mode.
 
@@ -1452,8 +1480,12 @@ def build_vertical_filter_plan(
     fraction that keeps captions off the detected face, or None to keep the
     template default. ``report["kind"]`` receives the layout kind.
     """
+    kwargs: Dict[str, Any] = {}
+    if gameplay_mode:
+        kwargs["gameplay_mode"] = True
+        kwargs["gameplay_webcam_box"] = gameplay_webcam_box
     described = describe_vertical_layout(
-        input_path, width, height, speaker_turns, speaker_words
+        input_path, width, height, speaker_turns, speaker_words, **kwargs
     )
     if report is not None:
         report["kind"] = described["kind"]
@@ -1468,6 +1500,9 @@ def describe_vertical_layout(
     height: int,
     speaker_turns: Optional[List[Dict[str, Any]]] = None,
     speaker_words: Optional[List[Dict[str, Any]]] = None,
+    *,
+    gameplay_mode: bool = False,
+    gameplay_webcam_box: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Same plan as ``build_vertical_filter_plan``, plus a layout ``kind``.
 
@@ -1564,12 +1599,24 @@ def describe_vertical_layout(
                 face_samples = combined
         except Exception as exc:
             logger.debug("Reaction detail analysis unavailable: %s", exc)
+    if gameplay_mode and crop_w < width:
+        wb = gameplay_webcam_box or {}
+        if wb.get("has_webcam", True) and str(wb.get("method", "")).startswith("hint:"):
+            logger.info("Gameplay split layout (explicit webcam hint %s): %s", wb.get("method"), wb)
+            return build_gameplay_split_layout(width, height, wb)
+
     reaction = choose_reaction_layout(
         input_path, width, height, duration, face_samples, scene_cuts
     )
     if reaction:
         logger.info("Reaction layout: inset %s, %d source sections", reaction['inset'], len(reaction['source_runs']))
         return _described("reaction", reaction["video_filter"], "complex", reaction["caption_y"])
+
+    if gameplay_mode and crop_w < width:
+        wb = gameplay_webcam_box or {}
+        if wb.get("has_webcam", True):
+            logger.info("Gameplay split layout (%s): %s", wb.get("method", "fallback"), wb)
+            return build_gameplay_split_layout(width, height, wb)
 
     # A sit-down interview (a two-shot, usually cut with close-ups) is composed
     # shot by shot: both people stacked, one person cropped tight, graphics

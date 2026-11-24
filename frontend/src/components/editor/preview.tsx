@@ -33,6 +33,8 @@ import {
   footageKey,
   footageUrl,
   frameRect,
+  isSourceSpanActive,
+  mapSourceSpan,
   outputSize,
   outputTime,
   timecode,
@@ -84,6 +86,9 @@ export function Preview({
   const [previewWidth, setPreviewWidth] = useState(270);
   const canvasRef = useRef<HTMLCanvasElement>(null),
     audioRef = useRef<{ context: AudioContext; gain: GainNode } | null>(null);
+  const musicPlayerRef = useRef<{ trackId: string; el: HTMLAudioElement } | null>(null);
+  const firedSfxRef = useRef<Map<string, number>>(new Map());
+  const prevOutTimeRef = useRef(0);
   // One hidden, muted player per stock video, kept in step with the clip.
   const brollPlayers = useRef(new Map<string, HTMLVideoElement>());
   const footage = [
@@ -164,9 +169,32 @@ export function Preview({
   useEffect(
     () => () => {
       void audioRef.current?.context.close();
+      if (musicPlayerRef.current) {
+        musicPlayerRef.current.el.pause();
+        musicPlayerRef.current = null;
+      }
     },
     [],
   );
+  useEffect(() => {
+    const trackId = doc.viral?.music?.trackId ?? "none";
+    const active = playing && !doc.muted && trackId !== "none";
+    if (!active) {
+      if (musicPlayerRef.current && !musicPlayerRef.current.el.paused) {
+        musicPlayerRef.current.el.pause();
+      }
+      return;
+    }
+    if (!musicPlayerRef.current || musicPlayerRef.current.trackId !== trackId) {
+      musicPlayerRef.current?.el.pause();
+      const el = new Audio(`/api/tasks/viral-audio/music/${trackId}`);
+      el.loop = true;
+      musicPlayerRef.current = { trackId, el };
+    }
+    const el = musicPlayerRef.current.el;
+    el.volume = Math.max(0.02, Math.min(1, doc.viral?.music?.volume ?? 0.25));
+    void el.play().catch(() => {});
+  }, [playing, doc.muted, doc.viral?.music?.trackId, doc.viral?.music?.volume]);
   useEffect(() => {
     let frame: number;
     const draw = () => {
@@ -212,19 +240,68 @@ export function Preview({
               draw: (x, y, w, h) => context?.drawImage(player, x, y, w, h),
             };
         }
+        const outAt = outputTime(
+          doc,
+          Math.min(segmentIndex, doc.segments.length - 1),
+          video.currentTime,
+        );
+        if (outAt + 0.35 < prevOutTimeRef.current || video.paused) {
+          firedSfxRef.current.clear();
+        }
+        prevOutTimeRef.current = outAt;
+        if (!video.paused && !doc.muted && doc.viral) {
+          const inFreeze = (doc.viral.timeEffects ?? []).some(
+            (te) => te.kind === "freeze_bw" && isSourceSpanActive(doc, te.start, te.end, outAt),
+          );
+          if (musicPlayerRef.current && doc.viral.music.trackId !== "none") {
+            const baseVol = doc.viral.music.volume ?? 0.25;
+            const targetVol = inFreeze
+              ? Math.min(1, baseVol * 1.4)
+              : doc.viral.music.autoDuck
+                ? baseVol * 0.55
+                : baseVol;
+            musicPlayerRef.current.el.volume = Math.max(0.02, Math.min(1, targetVol));
+          }
+          for (const sfx of doc.viral.sfx ?? []) {
+            if (sfx.volume <= 0.01) continue;
+            const spans = mapSourceSpan(doc, sfx.start, sfx.start + 0.12);
+            if (!spans.length) continue;
+            const outStart = spans[0][0];
+            if (Math.abs(outAt - outStart) <= 0.12) {
+              const prev = firedSfxRef.current.get(sfx.id);
+              if (prev === undefined || Math.abs(outAt - prev) > 0.6) {
+                firedSfxRef.current.set(sfx.id, outAt);
+                const el = new Audio(`/api/tasks/viral-audio/sfx/${sfx.sfxId}`);
+                el.volume = Math.max(0, Math.min(1, sfx.volume));
+                void el.play().catch(() => {});
+              }
+            }
+          }
+        }
         if (context)
           drawEditorFrame(
             context,
             doc,
             video.videoWidth || asset.width,
             video.videoHeight || asset.height,
-            outputTime(
-              doc,
-              Math.min(segmentIndex, doc.segments.length - 1),
-              video.currentTime,
-            ),
-            (rect) =>
-              context.drawImage(video, rect.x, rect.y, rect.width, rect.height),
+            outAt,
+            (rect, srcCrop) => {
+              if (srcCrop) {
+                context.drawImage(
+                  video,
+                  srcCrop.sx,
+                  srcCrop.sy,
+                  srcCrop.sw,
+                  srcCrop.sh,
+                  rect.x,
+                  rect.y,
+                  rect.width,
+                  rect.height,
+                );
+              } else {
+                context.drawImage(video, rect.x, rect.y, rect.width, rect.height);
+              }
+            },
             asset.captionLooks,
             layer,
             "none",
@@ -306,7 +383,7 @@ export function Preview({
           <video
             ref={videoRef}
             crossOrigin="anonymous"
-            src={`${endpoint}/media/${asset.hasLayout && doc.framing.fit === "auto" && doc.framing.aspect === "vertical" ? "layout" : "clean"}.mp4`}
+            src={`${endpoint}/media/${!(doc.viral && ["split", "fullscreen_cam", "pip"].includes(doc.viral.layoutMode)) && asset.hasLayout && doc.framing.fit === "auto" && doc.framing.aspect === "vertical" ? "layout" : "clean"}.mp4`}
             preload="auto"
             playsInline
             className="hidden"

@@ -1,6 +1,7 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
 import {
   AlertCircle,
@@ -10,6 +11,7 @@ import {
   CloudOff,
   Download,
   Film,
+  Flame,
   HardDrive,
   History,
   Keyboard,
@@ -113,6 +115,8 @@ export function EditorWorkspace({
   refreshClips,
 }: Props) {
   const t = useTranslations("editor");
+  const router = useRouter();
+  const [openingStudio, setOpeningStudio] = useState(false);
   const endpoint = `/api/tasks/${taskId}/clips/${clip.id}/editor`;
   const editor = useEditor(endpoint),
     doc = editor.document,
@@ -524,6 +528,27 @@ export function EditorWorkspace({
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="rounded-full gap-1.5 px-3"
+          disabled={!doc || openingStudio}
+          data-testid="open-tiktok-studio-button"
+          onClick={async () => {
+            setOpeningStudio(true);
+            try {
+              await editor.save();
+              router.push(`/tiktok-studio?task=${taskId}&clip=${clip.id}`);
+            } catch {
+              toast.error("Não foi possível salvar antes de abrir o Estúdio TikTok.");
+              setOpeningStudio(false);
+            }
+          }}
+        >
+          {openingStudio ? <Loader2 className="size-3.5 animate-spin" /> : <Flame className="size-3.5 text-amber-500" />}
+          <span className="hidden sm:inline">Estúdio TikTok</span>
+        </Button>
         <Button className="rounded-full px-4" disabled={!doc} onClick={() => setExportOpen(true)}>
           <Download />
           {t("workspace.export")}

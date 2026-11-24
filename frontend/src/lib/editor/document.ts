@@ -86,6 +86,121 @@ export interface BRollClip {
   fadeOut?: boolean;
   fadeDuration?: number | null;
 }
+
+export type SfxId =
+  | "vine_boom"
+  | "record_scratch"
+  | "windows_error"
+  | "crickets"
+  | "censor_beep"
+  | "sad_violin"
+  | "tension_riser"
+  | "whoosh";
+
+export type MusicId =
+  | "none"
+  | "sad_drama"
+  | "wii_quirky"
+  | "lofi_chill"
+  | "tension_suspense"
+  | "hype_phonk";
+
+export type VibeKind = "zoeira" | "clutch" | "fail" | "hype";
+export type GameplayLayoutMode = "off" | "split" | "fullscreen_cam" | "fullscreen_game" | "pip";
+
+export interface WebcamRegion {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  zoom?: number;
+}
+
+export interface CameraKeyframe {
+  id: string;
+  start: number;
+  end: number;
+  mode: "punch" | "slow_tension" | "shake" | "bw_dramatic";
+  zoom: number;
+  intensity: number;
+  target: "center" | "cam" | "game";
+  reason: string;
+}
+
+export interface LayoutSwitch {
+  id: string;
+  start: number;
+  end: number;
+  layout: "split" | "fullscreen_cam" | "fullscreen_game" | "pip";
+}
+
+export interface TimeEffect {
+  id: string;
+  start: number;
+  end: number;
+  kind: "freeze_bw" | "explosion_cut" | "speed_ramp" | "cold_open";
+  freezeDuration: number;
+  speed: number;
+  reason: string;
+}
+
+export interface SubtextOverlay {
+  id: string;
+  start: number;
+  end: number;
+  text: string;
+  x: number;
+  y: number;
+  color: string;
+  variant: "thought" | "tracker" | "censor_bar";
+}
+
+export interface SfxPlacement {
+  id: string;
+  sfxId: SfxId;
+  start: number;
+  volume: number;
+}
+
+export interface BackgroundMusic {
+  trackId: MusicId;
+  volume: number;
+  autoDuck: boolean;
+}
+
+export interface VoiceEffect {
+  id: string;
+  start: number;
+  end: number;
+  effect: "bass_boost" | "reverb";
+}
+
+export interface ViralSuggestion {
+  id: string;
+  enabled: boolean;
+  timestamp: number;
+  end: number;
+  category: "camera" | "fail" | "explosion" | "speed" | "subtext" | "sfx" | "layout";
+  title: string;
+  reason: string;
+}
+
+export interface ViralEditConfig {
+  mode: "auto" | "hybrid";
+  vibe: VibeKind;
+  layoutMode: GameplayLayoutMode;
+  webcamBox: WebcamRegion;
+  layoutSwitches: LayoutSwitch[];
+  cameraKeyframes: CameraKeyframe[];
+  timeEffects: TimeEffect[];
+  subtexts: SubtextOverlay[];
+  speakerColors: Record<string, string>;
+  sfx: SfxPlacement[];
+  music: BackgroundMusic;
+  voiceEffects: VoiceEffect[];
+  suggestions: ViralSuggestion[];
+}
+
 export interface EditDocument {
   version: 1;
   segments: Segment[];
@@ -105,6 +220,8 @@ export interface EditDocument {
   captionTransforms?: Record<string, CaptionTransform>;
   /** Absent on drafts cached before the editor had B-roll. */
   broll?: BRollClip[];
+  /** Non-destructive charismatic/viral TikTok & Gameplay edit layer. */
+  viral?: ViralEditConfig | null;
 }
 export type TextLayer = "hook" | "captions";
 export interface TextTransform { x: number; y: number; scale: number }
@@ -317,13 +434,43 @@ export function outputTime(
   segmentIndex: number,
   sourceTime: number,
 ) {
+  const seg = doc.segments[segmentIndex] ?? doc.segments[0];
+  if (!seg) return sourceTime;
   return (
     doc.segments
       .slice(0, segmentIndex)
       .reduce((sum, s) => sum + s.end - s.start, 0) +
     sourceTime -
-    doc.segments[segmentIndex].start
+    seg.start
   );
+}
+export function mapSourceSpan(
+  doc: EditDocument,
+  start: number,
+  end: number,
+): [number, number][] {
+  const spans: [number, number][] = [];
+  let cursor = 0;
+  for (const seg of doc.segments) {
+    const s = Math.max(seg.start, start);
+    const e = Math.min(seg.end, end);
+    if (e - s > 0.02) {
+      spans.push([cursor + (s - seg.start), cursor + (e - seg.start)]);
+    }
+    cursor += seg.end - seg.start;
+  }
+  return spans;
+}
+export function isSourceSpanActive(
+  doc: EditDocument,
+  start: number,
+  end: number,
+  outputAt: number,
+): boolean {
+  for (const [s, e] of mapSourceSpan(doc, start, end)) {
+    if (outputAt >= s && outputAt <= e) return true;
+  }
+  return false;
 }
 export function splitSegment(
   doc: EditDocument,
@@ -341,6 +488,122 @@ export function splitSegment(
     { id: uid(), start: at, end: segment.end },
   );
   return { ...doc, segments };
+}
+
+export function locateOutputTime(
+  doc: EditDocument,
+  outputSeconds: number,
+): {
+  segmentIndex: number;
+  sourceTime: number;
+  segmentStartOutput: number;
+  segmentEndOutput: number;
+} {
+  const total = editDuration(doc);
+  const target = clamp(outputSeconds, 0, Math.max(0, total));
+  let cursor = 0;
+  for (let i = 0; i < doc.segments.length; i++) {
+    const seg = doc.segments[i];
+    const len = Math.max(0, seg.end - seg.start);
+    if (target <= cursor + len || i === doc.segments.length - 1) {
+      const offset = clamp(target - cursor, 0, len);
+      return {
+        segmentIndex: i,
+        sourceTime: seg.start + offset,
+        segmentStartOutput: cursor,
+        segmentEndOutput: cursor + len,
+      };
+    }
+    cursor += len;
+  }
+  return { segmentIndex: 0, sourceTime: 0, segmentStartOutput: 0, segmentEndOutput: 0 };
+}
+
+export function trimStartAt(
+  doc: EditDocument,
+  segmentIndex: number,
+  sourceTime: number,
+): EditDocument {
+  const idx = clamp(segmentIndex, 0, Math.max(0, doc.segments.length - 1));
+  const seg = doc.segments[idx];
+  if (!seg) return doc;
+  const remainingInSeg = seg.end - sourceTime;
+  const tail = doc.segments.slice(idx + 1);
+  if (remainingInSeg < 0.15) {
+    if (!tail.length) return doc;
+    return { ...doc, segments: tail };
+  }
+  if (sourceTime <= seg.start + 0.04 && idx === 0) return doc;
+  const trimmedFirst: Segment = { ...seg, start: clamp(sourceTime, seg.start, seg.end - 0.15) };
+  return { ...doc, segments: [trimmedFirst, ...tail] };
+}
+
+export function trimEndAt(
+  doc: EditDocument,
+  segmentIndex: number,
+  sourceTime: number,
+): EditDocument {
+  const idx = clamp(segmentIndex, 0, Math.max(0, doc.segments.length - 1));
+  const seg = doc.segments[idx];
+  if (!seg) return doc;
+  const keptInSeg = sourceTime - seg.start;
+  const head = doc.segments.slice(0, idx);
+  if (keptInSeg < 0.15) {
+    if (!head.length) return doc;
+    return { ...doc, segments: head };
+  }
+  if (sourceTime >= seg.end - 0.04 && idx === doc.segments.length - 1) return doc;
+  const trimmedLast: Segment = { ...seg, end: clamp(sourceTime, seg.start + 0.15, seg.end) };
+  return { ...doc, segments: [...head, trimmedLast] };
+}
+
+export function deleteSegmentAt(
+  doc: EditDocument,
+  segmentIndex: number,
+): EditDocument {
+  if (doc.segments.length <= 1) return doc;
+  if (segmentIndex < 0 || segmentIndex >= doc.segments.length) return doc;
+  return {
+    ...doc,
+    segments: doc.segments.filter((_, i) => i !== segmentIndex),
+  };
+}
+
+export function cutOutputRange(
+  doc: EditDocument,
+  startOut: number,
+  endOut: number,
+): EditDocument {
+  const total = editDuration(doc);
+  const a = clamp(Math.min(startOut, endOut), 0, total);
+  const b = clamp(Math.max(startOut, endOut), 0, total);
+  if (b - a < 0.1) return doc;
+
+  const next: Segment[] = [];
+  let cursor = 0;
+  for (const seg of doc.segments) {
+    const len = Math.max(0, seg.end - seg.start);
+    const segStart = cursor;
+    const segEnd = cursor + len;
+    cursor = segEnd;
+
+    if (segEnd <= a || segStart >= b) {
+      next.push(seg);
+      continue;
+    }
+    const leftLen = a - segStart;
+    if (leftLen >= 0.1) {
+      next.push({ ...seg, end: seg.start + leftLen });
+    }
+    const rightLen = segEnd - b;
+    if (rightLen >= 0.1) {
+      next.push({ id: leftLen >= 0.1 ? uid() : seg.id, start: seg.end - rightLen, end: seg.end });
+    }
+  }
+  if (!next.length) return doc;
+  const nextTotal = next.reduce((sum, s) => sum + (s.end - s.start), 0);
+  if (nextTotal < 0.2) return doc;
+  return { ...doc, segments: next };
 }
 /** Correcting a phrase retains existing time anchors; inserted words share only the replaced span. */
 export function replaceWords(

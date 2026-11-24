@@ -81,18 +81,32 @@ def normalize_filtered_words(value: Any) -> list[str]:
     return normalized
 
 
+VALID_WEBCAM_POSITIONS = ("auto", "top_left", "top_right", "bottom_left", "bottom_right")
+
+
+def normalize_webcam_position(value: Any) -> str:
+    cleaned = str(value or "").strip().lower()
+    return cleaned if cleaned in VALID_WEBCAM_POSITIONS else "auto"
+
+
 def normalize_clip_cleanup_settings(
     cut_long_pauses: Any = False,
     pause_threshold_ms: Any = DEFAULT_PAUSE_THRESHOLD_MS,
     remove_filler_words: Any = False,
     filtered_words: Any = None,
+    gameplay_mode: Any = False,
+    webcam_position: Any = None,
 ) -> dict[str, Any]:
-    return {
+    out: dict[str, Any] = {
         "cut_long_pauses": bool(cut_long_pauses),
         "pause_threshold_ms": normalize_pause_threshold_ms(pause_threshold_ms),
         "remove_filler_words": bool(remove_filler_words),
         "filtered_words": normalize_filtered_words(filtered_words),
     }
+    if bool(gameplay_mode):
+        out["gameplay_mode"] = True
+        out["webcam_position"] = normalize_webcam_position(webcam_position)
+    return out
 
 
 def new_task_cleanup_settings(data: dict[str, Any]) -> dict[str, Any]:
@@ -106,6 +120,8 @@ def new_task_cleanup_settings(data: dict[str, Any]) -> dict[str, Any]:
         data.get("pause_threshold_ms"),
         data.get("remove_filler_words", NEW_TASK_REMOVE_FILLER_WORDS),
         data.get("filtered_words"),
+        gameplay_mode=data.get("gameplay_mode", False),
+        webcam_position=data.get("webcam_position"),
     )
 
 
@@ -123,6 +139,8 @@ def updated_cleanup_settings(
         value("pause_threshold_ms"),
         value("remove_filler_words"),
         value("filtered_words"),
+        gameplay_mode=value("gameplay_mode"),
+        webcam_position=value("webcam_position"),
     )
 
 

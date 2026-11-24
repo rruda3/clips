@@ -2,6 +2,8 @@
   "nav": {
     "create": "Buat",
     "library": "Pustaka",
+    "tiktokStudio": "Studio TikTok",
+    "cache": "Cache Video",
     "social": "Sosial",
     "analytics": "Analitik",
     "agents": "Agen & API",

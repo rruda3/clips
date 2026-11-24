@@ -9,6 +9,7 @@ import assemblyai as aai
 from ..config import get_config
 import httpx
 import json
+import os
 import re
 import time
 from .common import (
@@ -186,6 +187,99 @@ def _get_whisper_model(model_name: str = "base"):
     return _WHISPER_MODEL_CACHE[model_name]
 
 
+def _prepare_wav_for_whisper_server(video_path: Path) -> Path:
+    """Extract a 16kHz mono PCM WAV file for whisper.cpp server."""
+    wav_path = video_path.with_name(f"{video_path.stem}.transcription.wav")
+    if wav_path.exists() and wav_path.stat().st_size > 0:
+        return wav_path
+
+    audio_stream = select_audio_stream_index(video_path)
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_path),
+        *(["-map", f"0:a:{audio_stream}"] if audio_stream is not None else []),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        str(wav_path),
+    ]
+    result = run_ffmpeg_command(command, timeout=900)
+    if result.returncode != 0 or not wav_path.exists() or wav_path.stat().st_size == 0:
+        raise RuntimeError("Failed to extract 16kHz WAV audio for whisper-server")
+    return wav_path
+
+
+def _merge_whisper_cpp_subword_tokens(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge BPE subword tokens from whisper.cpp verbose_json into whole words."""
+    segments = result.get("segments")
+    if not isinstance(segments, list):
+        return result
+
+    for segment in segments:
+        raw_words = segment.get("words")
+        if not isinstance(raw_words, list) or not raw_words:
+            continue
+
+        merged: List[Dict[str, Any]] = []
+        for token in raw_words:
+            text = token.get("word", token.get("text", ""))
+            if not text:
+                continue
+
+            starts_new_word = text[0].isspace() or not merged
+            if starts_new_word:
+                merged.append(
+                    {
+                        "word": text.lstrip(),
+                        "start": token.get("start", 0.0),
+                        "end": token.get("end", token.get("start", 0.0)),
+                        "probability": token.get("probability", token.get("confidence", 1.0)),
+                    }
+                )
+            else:
+                prev = merged[-1]
+                prev["word"] += text
+                if "end" in token:
+                    prev["end"] = token["end"]
+                if "probability" in token:
+                    prev["probability"] = min(prev["probability"], token["probability"])
+
+        segment["words"] = [w for w in merged if w["word"]]
+
+    return result
+
+
+def _transcribe_with_whisper_server(
+    video_path: Path, server_url: str, language: Optional[str] = None
+) -> Dict[str, Any]:
+    """Send 16kHz WAV audio to an external whisper.cpp HTTP server."""
+    wav_path = _prepare_wav_for_whisper_server(video_path)
+    whisper_language = language.split("_", 1)[0] if language else "auto"
+    logger.info(
+        "Sending audio to external Whisper server %s (language: %s)",
+        server_url,
+        whisper_language,
+    )
+    with wav_path.open("rb") as audio_file:
+        with httpx.Client(timeout=1800.0) as client:
+            response = client.post(
+                server_url,
+                files={"file": (wav_path.name, audio_file, "audio/wav")},
+                data={
+                    "response_format": "verbose_json",
+                    "language": whisper_language,
+                },
+            )
+            response.raise_for_status()
+            return _merge_whisper_cpp_subword_tokens(response.json())
+
+
 def transcribe_with_whisper(
     video_path: Path, model_name: str = "base", language: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -194,6 +288,17 @@ def transcribe_with_whisper(
     ``language`` None lets Whisper detect it; AssemblyAI-style codes such as
     ``en_us`` are reduced to the ISO 639-1 base Whisper expects.
     """
+    whisper_server_url = os.getenv("WHISPER_SERVER_URL", "").strip()
+    if whisper_server_url:
+        try:
+            return _transcribe_with_whisper_server(video_path, whisper_server_url, language)
+        except Exception as error:
+            logger.warning(
+                "External Whisper server %s failed (%s); falling back to in-container Whisper",
+                whisper_server_url,
+                error,
+            )
+
     audio_path = _prepare_audio_for_transcription(video_path)
     model = _get_whisper_model(model_name)
     whisper_language = language.split("_", 1)[0] if language else None

@@ -16,7 +16,6 @@ import uuid
 from .caption_templates import get_template
 from .workflows.language import is_no_space
 from .media.ffmpeg import ffmpeg_escape_filter_path, ffprobe_video_size
-from .media.source_limits import FPS_EPSILON, MAX_OUTPUT_FPS, probe_video_geometry
 from .video_utils import (
     ass_fonts_dir,
     build_assemblyai_ass_subtitles,
@@ -36,9 +35,9 @@ class ExportPreset:
 
 
 EXPORT_PRESETS = {
-    "tiktok": ExportPreset("tiktok", 1080, 1920, "10M", "192k"),
-    "reels": ExportPreset("reels", 1080, 1920, "12M", "192k"),
-    "shorts": ExportPreset("shorts", 1080, 1920, "10M", "192k"),
+    "tiktok": ExportPreset("tiktok", 1080, 1920, "20M", "192k"),
+    "reels": ExportPreset("reels", 1080, 1920, "22M", "192k"),
+    "shorts": ExportPreset("shorts", 1080, 1920, "20M", "192k"),
 }
 
 
@@ -507,11 +506,8 @@ def export_with_preset(
         f"scale={preset.width}:{preset.height}:"
         "force_original_aspect_ratio=decrease:flags=lanczos,"
         f"pad={preset.width}:{preset.height}:(ow-iw)/2:(oh-ih)/2,"
-        "setsar=1"
+        "setsar=1,fps=60"
     )
-    geometry = probe_video_geometry(input_path)
-    if geometry and geometry.fps is not None and geometry.fps > MAX_OUTPUT_FPS + FPS_EPSILON:
-        scale_filter = f"fps={MAX_OUTPUT_FPS},{scale_filter}"
     command = [
         "ffmpeg",
         "-y",
@@ -522,9 +518,11 @@ def export_with_preset(
         "-c:v",
         "libx264",
         "-preset",
-        "slow",
+        "medium",
         "-crf",
-        "18",
+        "16",
+        "-r",
+        "60",
         "-maxrate",
         preset.video_bitrate,
         "-bufsize",
@@ -533,6 +531,8 @@ def export_with_preset(
         "yuv420p",
         "-profile:v",
         "high",
+        "-level",
+        "4.2",
         "-c:a",
         "aac",
         "-b:a",

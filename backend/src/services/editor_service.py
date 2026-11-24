@@ -234,7 +234,7 @@ PRESERVED_LAYOUT_KINDS = frozenset({"split", "stack", "reaction", "overlap", "in
 # Plans kept beside the uncropped source as layout.mp4 ("Auto layout"), so the
 # studio opens on the generated framing and manual crops still start from the
 # full frame: content fits, the compositor, and the tracked face/speaker crops.
-CONTENT_LAYOUT_KINDS = frozenset({"fit", "compositor", "crop", "speaker", "stage", "generated"})
+CONTENT_LAYOUT_KINDS = frozenset({"fit", "compositor", "crop", "speaker", "stage", "generated", "gameplay_split"})
 # A stored plan is replayed only on the media it was planned for.
 STORED_LAYOUT_DURATION_TOLERANCE = 0.25
 
@@ -245,6 +245,9 @@ def editor_preserved_layout(
     speaker_turns: list | None = None,
     speaker_words: list | None = None,
     include_content: bool = False,
+    *,
+    gameplay_mode: bool = False,
+    gameplay_webcam_box: dict | None = None,
 ) -> dict | None:
     """Split-screen or stacked plan to bake into the editor source.
 
@@ -270,8 +273,18 @@ def editor_preserved_layout(
         if output_format != "vertical":
             return None
         width, height = ffprobe_video_size(clip_path)
+        gp_kwargs = (
+            {"gameplay_mode": True, "gameplay_webcam_box": gameplay_webcam_box}
+            if gameplay_mode
+            else {}
+        )
         described = describe_vertical_layout(
-            clip_path, width, height, speaker_turns, speaker_words
+            clip_path,
+            width,
+            height,
+            speaker_turns,
+            speaker_words,
+            **gp_kwargs,
         )
     except Exception:
         logging.getLogger(__name__).warning(
@@ -347,6 +360,9 @@ def bake_editor_layout(
     ranges: list,
     preserve_content: bool = False,
     stored: dict | None = None,
+    *,
+    gameplay_mode: bool = False,
+    gameplay_webcam_box: dict | None = None,
 ) -> bool:
     """Compose the clip's generated layout for the editor.
 
@@ -363,6 +379,16 @@ def bake_editor_layout(
         layout = {"kind": "fit", "landscape_recommended": False, "output_format": "vertical_fit"}
     else:
         layout = stored_editor_layout(clean, stored) if output_format == "vertical" else None
+        # Earlier gameplay split clips recorded kind="reaction"; treat them as
+        # reversible content layouts when preserving the landscape source so the
+        # editor keeps clean.mp4 at 16:9 and writes split into layout.mp4.
+        if (
+            layout
+            and preserve_content
+            and gameplay_mode
+            and layout.get("kind") == "reaction"
+        ):
+            layout = {**layout, "kind": "gameplay_split"}
     if layout is None and output_format != "vertical_fit":
         turns: list = []
         words: list = []
@@ -376,7 +402,15 @@ def bake_editor_layout(
                 logging.getLogger(__name__).warning(
                     "Speaker turns unavailable for the editor layout", exc_info=True
                 )
-        layout = editor_preserved_layout(clean, output_format, turns, words, include_content=preserve_content)
+        layout = editor_preserved_layout(
+            clean,
+            output_format,
+            turns,
+            words,
+            include_content=preserve_content,
+            gameplay_mode=gameplay_mode,
+            gameplay_webcam_box=gameplay_webcam_box,
+        )
     if not layout:
         return False
     if preserve_content and layout["kind"] not in PRESERVED_LAYOUT_KINDS:
@@ -450,12 +484,73 @@ async def document_footage(document: EditDocument) -> dict:
     return files
 
 
+def build_gameplay_viral_config(webcam_box: dict | None) -> dict | None:
+    """Default split-screen viral layer when opening a gameplay clip in the editor."""
+    if not isinstance(webcam_box, dict):
+        return None
+    if not webcam_box.get("has_webcam", True) or webcam_box.get("already_vertical"):
+        return None
+    return {
+        "mode": "auto",
+        "vibe": "zoeira",
+        "layoutMode": "split",
+        "webcamBox": {
+            "x": float(webcam_box.get("x", 0.02)),
+            "y": float(webcam_box.get("y", 0.03)),
+            "w": float(webcam_box.get("w", 0.26)),
+            "h": float(webcam_box.get("h", 0.28)),
+            "zoom": float(webcam_box.get("zoom", 1.0)),
+        },
+        "layoutSwitches": [],
+        "cameraKeyframes": [],
+        "timeEffects": [],
+        "subtexts": [],
+        "speakerColors": {},
+        "sfx": [],
+        "music": {"trackId": "none", "volume": 0.25, "autoDuck": True},
+        "voiceEffects": [],
+        "suggestions": [],
+    }
+
+
+def _task_gameplay_settings(task: dict | None) -> tuple[bool, dict | None]:
+    if not isinstance(task, dict):
+        return False, None
+    meta = task.get("source_metadata") if isinstance(task.get("source_metadata"), dict) else {}
+    gameplay_mode = bool(task.get("gameplay_mode") or meta.get("gameplay_mode"))
+    wb = task.get("resolved_webcam_box")
+    if not isinstance(wb, dict):
+        wb = meta.get("resolved_webcam_box")
+    return gameplay_mode, (wb if isinstance(wb, dict) else None)
+
+
+def needs_gameplay_landscape_restore(task: dict | None, state: dict | None) -> bool:
+    """True when an earlier gameplay prepare overwrote clean.mp4 into portrait."""
+    if not isinstance(state, dict) or state.get("status") != "ready":
+        return False
+    gameplay_mode, wb = _task_gameplay_settings(task)
+    if not gameplay_mode or not isinstance(wb, dict):
+        return False
+    if not wb.get("has_webcam", True) or wb.get("already_vertical"):
+        return False
+    meta = task.get("source_metadata") if isinstance(task, dict) and isinstance(task.get("source_metadata"), dict) else {}
+    output_format = (task or {}).get("output_format") or meta.get("output_format") or "vertical"
+    if output_format == "original":
+        return False
+    width = state.get("width")
+    height = state.get("height")
+    return isinstance(width, (int, float)) and isinstance(height, (int, float)) and width <= height
+
+
 def upgrade_document(
     document: dict,
     clip: dict,
     task: dict,
     broll_placements: list | None = None,
     duration: float | None = None,
+    *,
+    source_width: int | float | None = None,
+    source_height: int | float | None = None,
 ) -> dict:
     """Fill fields that drafts saved by older editor versions don't have.
 
@@ -471,7 +566,7 @@ def upgrade_document(
         captions.setdefault("template", template_id)
         captions.setdefault("karaoke", template.get("animation") == "karaoke")
         captions.setdefault("uppercase", bool(template.get("uppercase")))
-    return {
+    upgraded = {
         **document,
         "captions": captions,
         "hookTitle": document.get("hookTitle", (burned_hook_title(clip) or "")[:200]),
@@ -483,6 +578,19 @@ def upgrade_document(
             else [],
         ),
     }
+    if upgraded.get("viral") is None:
+        aspect = (upgraded.get("framing") or {}).get("aspect") or "vertical"
+        gameplay_mode, wb = _task_gameplay_settings(task)
+        landscape = (
+            isinstance(source_width, (int, float))
+            and isinstance(source_height, (int, float))
+            and source_width > source_height
+        )
+        if aspect == "vertical" and gameplay_mode and landscape:
+            seeded_viral = build_gameplay_viral_config(wb)
+            if seeded_viral is not None:
+                upgraded["viral"] = seeded_viral
+    return upgraded
 
 
 @functools.cache
@@ -831,8 +939,15 @@ async def prepare_editor(ctx, task_id: str, clip_id: str, filename: str):
                 from ..clip_source_map import load_clip_vertical_layout
 
                 await run_in_thread(
-                    bake_editor_layout, clean, output_format, source, local_ranges, True,
+                    bake_editor_layout,
+                    clean,
+                    output_format,
+                    source,
+                    local_ranges,
+                    True,
                     load_clip_vertical_layout(metadata_path),
+                    gameplay_mode=bool(source_settings.get("gameplay_mode")),
+                    gameplay_webcam_box=source_settings.get("resolved_webcam_box"),
                 )
             metadata = await run_in_thread(make_assets, directory)
             expected = expected_prepared_duration(ranges, source_offsets)
@@ -860,33 +975,54 @@ async def prepare_editor(ctx, task_id: str, clip_id: str, filename: str):
             clip_width, clip_height = (
                 (metadata["width"], metadata["height"]) if original_format else (1080, 1920)
             )
-            initial = (
-                EditDocument.model_validate(
+            initial_viral = None
+            if (
+                source_settings.get("gameplay_mode")
+                and not original_format
+                and metadata["width"] > metadata["height"]
+            ):
+                wb = source_settings.get("resolved_webcam_box")
+                if not isinstance(wb, dict):
+                    try:
+                        from ..media.gameplay_signals import detect_gameplay_webcam_box_smart
+
+                        wb = await run_in_thread(
+                            detect_gameplay_webcam_box_smart,
+                            clean,
+                            duration,
+                            source_settings.get("webcam_position") or "auto",
+                            use_gemini=False,
+                        )
+                    except Exception:
+                        wb = None
+                initial_viral = build_gameplay_viral_config(wb)
+            initial_payload = {
+                "segments": [{"id": "original", "start": 0, "end": duration}],
+                "framing": {"aspect": "original" if original_format else "vertical", "fit": "auto" if metadata.get("hasLayout") else "cover"},
+                "captions": initial_caption_style(
+                    task,
+                    caption_settings,
+                    source_settings.get("add_subtitles", True),
+                    clip_width,
+                    clip_height,
+                ),
+                "hookTitle": (burned_hook_title(clip) or "")[:200],
+                "broll": editor_broll_from_placements(broll_placements, duration),
+                "words": [
                     {
-                        "segments": [{"id": "original", "start": 0, "end": duration}],
-                        "framing": {"aspect": "original" if original_format else "vertical", "fit": "auto" if metadata.get("hasLayout") else "cover"},
-                        "captions": initial_caption_style(
-                            task,
-                            caption_settings,
-                            source_settings.get("add_subtitles", True),
-                            clip_width,
-                            clip_height,
-                        ),
-                        "hookTitle": (burned_hook_title(clip) or "")[:200],
-                        "broll": editor_broll_from_placements(broll_placements, duration),
-                        "words": [
-                            {
-                                "id": f"word-{i}",
-                                "start": max(0, min(w["start"], duration - 0.01)),
-                                "end": max(0.01, min(w["end"], duration)),
-                                "text": w["text"][:120],
-                                "highlight": i in emphasis,
-                            }
-                            for i, w in enumerate(words)
-                            if w["start"] < duration and w["end"] > 0
-                        ],
+                        "id": f"word-{i}",
+                        "start": max(0, min(w["start"], duration - 0.01)),
+                        "end": max(0.01, min(w["end"], duration)),
+                        "text": w["text"][:120],
+                        "highlight": i in emphasis,
                     }
-                )
+                    for i, w in enumerate(words)
+                    if w["start"] < duration and w["end"] > 0
+                ],
+                **({"viral": initial_viral} if initial_viral is not None else {}),
+            }
+            initial = (
+                EditDocument.model_validate(initial_payload)
                 .validate_duration(duration)
                 .model_dump()
             )

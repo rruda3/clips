@@ -1047,6 +1047,7 @@ class VideoService:
                 broll_overlays=broll_overlays,
                 **({"output_offsets": output_offsets} if output_offsets is not None else {}),
                 **({"point_labels": point_labels} if point_labels else {}),
+                **({"cleanup_settings": cleanup_settings} if cleanup_settings and cleanup_settings.get("gameplay_mode") else {}),
             )
 
             if not success:
@@ -1150,6 +1151,7 @@ class VideoService:
         save_checkpoint: Callable[[Dict[str, Any]], Awaitable[None]],
         instructions: Optional[str] = None,
         max_clips: Optional[int] = None,
+        gameplay_mode: bool = False,
     ) -> tuple[Any, List[Dict[str, Any]], int, bool]:
         """Pick standalone highlights: (analysis, ranked segments with reserve, clip limit, final plan).
 
@@ -1197,21 +1199,44 @@ class VideoService:
                 relevant_parts = None
 
         if relevant_parts is None:
+            is_gameplay = bool(gameplay_mode or (instructions and "gameplay" in instructions.lower()))
             try:
                 clip_signals = await run_in_thread(
                     build_clip_signal_summary,
                     video_path,
                     transcript,
                 )
+                if is_gameplay:
+                    from ..media.gameplay_signals import format_gameplay_signals_for_prompt
+
+                    gp_signals = await run_in_thread(format_gameplay_signals_for_prompt, video_path)
+                    logger.info(
+                        "[GAMEPLAY_MODE] Extracted %d chars of audio-chaos radar signals",
+                        len(gp_signals or ""),
+                    )
+                    if gp_signals:
+                        clip_signals = f"{gp_signals}\n\n{clip_signals}" if clip_signals else gp_signals
             except Exception as exc:
                 logger.warning("Clip signal extraction failed: %s", exc)
                 clip_signals = None
+            gameplay_directive = (
+                "GAMEPLAY MODE (CRITICAL PRIORITY): DO NOT pick ordinary calm commentary or podcast-style explanations. "
+                "Instead, anchor your picks around the [GAMEPLAY CHAOS PEAK] timestamps above: sudden screams, explosions, "
+                "jumpscares, clutches, fails, and chaotic group laughter. Start each cut 4-6s BEFORE the peak for setup, "
+                "include the chaos peak itself, and hold through the immediate reaction afterwards."
+            )
+            effective_instructions = instructions
+            if is_gameplay:
+                if not effective_instructions:
+                    effective_instructions = gameplay_directive
+                elif "chaos peak" not in effective_instructions.lower():
+                    effective_instructions = f"{gameplay_directive}\n{effective_instructions}"
             relevant_parts = await VideoService.analyze_transcript(
                 transcript,
                 clip_signals=clip_signals,
                 performance_context=performance_context,
                 clip_length=clip_length,
-                **({"instructions": instructions} if instructions else {}),
+                **({"instructions": effective_instructions} if effective_instructions else {}),
             )
 
         await save_checkpoint({"analysis": {
@@ -1298,7 +1323,7 @@ class VideoService:
         # Retain a bounded reserve until picture checks finish, so a rejected
         # slate can be replaced by the next already-ranked candidate.
         if not prepared_segments:
-            segments_json = segments_json[: min(24, max(1, clip_limit) * 2)]
+            segments_json = segments_json[: min(36, max(24, max(1, clip_limit) * 2))]
 
         if not segments_json:
             logger.warning(
@@ -1585,6 +1610,7 @@ class VideoService:
                     save_checkpoint=save_checkpoint,
                     **({"instructions": instructions} if instructions else {}),
                     **({"max_clips": requested_clips} if requested_clips is not None else {}),
+                    gameplay_mode=bool((cleanup_settings or {}).get("gameplay_mode")),
                 )
             else:
                 if should_cancel and await should_cancel():

@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTranslations } from "next-intl";
 import {
-  AlertCircle, ArrowRight, ArrowUp, Captions, CaptionsOff, Check, ChevronDown, Clapperboard, Crop, FileVideo, SlidersHorizontal,
+  AlertCircle, ArrowRight, ArrowUp, Captions, CaptionsOff, Check, ChevronDown, Clapperboard, Crop, FileVideo, Gamepad2, SlidersHorizontal,
   Info, ListOrdered, Loader2, MessageSquareText, Timer, Paperclip, Sparkles, Target, Upload, Link2, Wand2, X,
 } from "lucide-react";
 import { CaptionSizeControl } from "@/components/caption-size-control";
@@ -192,6 +192,10 @@ export default function HomeApp() {
   const [workflowLengths, setWorkflowLengths] = useState<Partial<Record<LengthWorkflow, ClipLength>>>({});
   const [instructions, setInstructions] = useState("");
   const [instructionsOpen, setInstructionsOpen] = useState(false);
+  const [gameplayMode, setGameplayMode] = useState(false);
+  const [webcamPosition, setWebcamPosition] = useState<
+    "auto" | "top_left" | "top_right" | "bottom_left" | "bottom_right"
+  >("auto");
   // Per workflow: settings mean different things in each, and switching back keeps them.
   const [advancedByWorkflow, setAdvancedByWorkflow] = useState<Partial<Record<Workflow, AdvancedValues>>>({});
   const [sourceSeconds, setSourceSeconds] = useState<number | null>(null);
@@ -795,6 +799,10 @@ export default function HomeApp() {
       if (advancedCount > 0) options.advanced = advancedChanges;
       if (Object.keys(options).length > 0) request.workflow_options = options;
       if (sentInstructions) request.instructions = sentInstructions;
+      if (gameplayMode) {
+        request.gameplay_mode = true;
+        request.webcam_position = webcamPosition;
+      }
 
       setStatusMessage(sourceType === "youtube" ? t("status.checkingLength") : t("status.starting"));
       const startResponse = await fetch("/api/tasks/create", {
@@ -1104,6 +1112,69 @@ export default function HomeApp() {
                 >
                   <MessageSquareText className="size-3.5" />
                 </Chip>
+              )}
+
+              <Chip
+                data-testid="gameplay-mode-chip"
+                onClick={() => {
+                  const next = !gameplayMode;
+                  setGameplayMode(next);
+                  if (next) {
+                    setOutputFormat("vertical");
+                  }
+                  if (instructionsOffered) {
+                    const tag = "[GAMEPLAY: focar em barulhos, explosões, risadas, caos e dividir câmera + jogo]";
+                    if (!next && instructions.includes(tag)) {
+                      setInstructions(instructions.replace(tag, "").trim());
+                    } else if (next && !instructions.toLowerCase().includes("gameplay")) {
+                      setInstructions(appendInstruction(instructions, tag));
+                      setInstructionsOpen(true);
+                    }
+                  }
+                }}
+                disabled={controlsDisabled}
+                active={gameplayMode}
+                aria-pressed={gameplayMode}
+                aria-label="Modo Gameplay"
+                title="Ativar Modo Gameplay (Radar de Explosões, Gritos, Risadas + Câmera/Jogo)"
+                className="px-2.5"
+              >
+                <Gamepad2 className="size-3.5" />
+                <span className="hidden sm:inline">Gameplay</span>
+              </Chip>
+
+              {gameplayMode && (
+                <div
+                  data-testid="webcam-position-picker"
+                  className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[11px]"
+                >
+                  <span className="font-medium text-amber-700 dark:text-amber-300">Cam:</span>
+                  {(
+                    [
+                      ["auto", "Auto IA"],
+                      ["top_left", "↖ Sup.Esq"],
+                      ["top_right", "↗ Sup.Dir"],
+                      ["bottom_left", "↙ Inf.Esq"],
+                      ["bottom_right", "↘ Inf.Dir"],
+                    ] as const
+                  ).map(([id, label]) => (
+                    <button
+                      key={id}
+                      type="button"
+                      disabled={controlsDisabled}
+                      data-testid={`webcam-pos-${id}`}
+                      onClick={() => setWebcamPosition(id)}
+                      className={cn(
+                        "rounded-full px-1.5 py-0.5 transition-colors",
+                        webcamPosition === id
+                          ? "bg-foreground font-semibold text-background"
+                          : "text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
               )}
 
               <ComposerSettings

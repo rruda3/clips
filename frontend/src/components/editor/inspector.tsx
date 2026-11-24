@@ -5,6 +5,7 @@ import {
   AlignCenter,
   Bookmark,
   Captions,
+  CaptionsOff,
   Clapperboard,
   Crop,
   Highlighter,
@@ -15,6 +16,8 @@ import {
   RotateCcw,
   Trash2,
   Volume2,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -185,6 +188,26 @@ export function Inspector({
                 />
               }
             >
+              <Button
+                type="button"
+                variant={doc.captions.enabled ? "outline" : "secondary"}
+                size="sm"
+                className="w-full justify-center gap-2 text-xs"
+                data-testid="inspector-toggle-captions"
+                onClick={() => caption({ enabled: !doc.captions.enabled })}
+              >
+                {doc.captions.enabled ? (
+                  <>
+                    <CaptionsOff className="size-3.5" />
+                    Tirar legenda
+                  </>
+                ) : (
+                  <>
+                    <Captions className="size-3.5" />
+                    Ativar legenda
+                  </>
+                )}
+              </Button>
               <div className="grid grid-cols-3 gap-2">
                 {(
                   [
@@ -769,6 +792,152 @@ export function Inspector({
                 {t("framing.center")}
               </Button>
             </Section>
+            {doc.viral && doc.viral.layoutMode !== "off" && (
+              <Section title="Câmera (Webcam)">
+                <Range
+                  label="Webcam X"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={Math.round(doc.viral.webcamBox.x * 100)}
+                  unit="%"
+                  onChange={(val) =>
+                    update(
+                      (d) =>
+                        d.viral
+                          ? {
+                              ...d,
+                              viral: {
+                                ...d.viral,
+                                webcamBox: {
+                                  ...d.viral.webcamBox,
+                                  x: clamp(val / 100, 0, 1),
+                                },
+                              },
+                            }
+                          : d,
+                      "gesture:webcam",
+                    )
+                  }
+                />
+                <Range
+                  label="Webcam Y"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={Math.round(doc.viral.webcamBox.y * 100)}
+                  unit="%"
+                  onChange={(val) =>
+                    update(
+                      (d) =>
+                        d.viral
+                          ? {
+                              ...d,
+                              viral: {
+                                ...d.viral,
+                                webcamBox: {
+                                  ...d.viral.webcamBox,
+                                  y: clamp(val / 100, 0, 1),
+                                },
+                              },
+                            }
+                          : d,
+                      "gesture:webcam",
+                    )
+                  }
+                />
+                <Range
+                  label="Zoom da Câmera"
+                  min={0.5}
+                  max={2.5}
+                  step={0.05}
+                  value={doc.viral.webcamBox.zoom ?? 1}
+                  unit="×"
+                  onChange={(zoom) =>
+                    update(
+                      (d) =>
+                        d.viral
+                          ? {
+                              ...d,
+                              viral: {
+                                ...d.viral,
+                                webcamBox: {
+                                  ...d.viral.webcamBox,
+                                  zoom: Math.round(clamp(zoom, 0.5, 2.5) * 100) / 100,
+                                },
+                              },
+                            }
+                          : d,
+                      "gesture:webcam",
+                    )
+                  }
+                />
+                <div className="grid grid-cols-2 gap-1.5">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={(doc.viral.webcamBox.zoom ?? 1) <= 0.5}
+                    data-testid="inspector-webcam-zoom-out"
+                    onClick={() =>
+                      update(
+                        (d) =>
+                          d.viral
+                            ? {
+                                ...d,
+                                viral: {
+                                  ...d.viral,
+                                  webcamBox: {
+                                    ...d.viral.webcamBox,
+                                    zoom:
+                                      Math.round(
+                                        clamp((d.viral.webcamBox.zoom ?? 1) - 0.15, 0.5, 2.5) * 100,
+                                      ) / 100,
+                                  },
+                                },
+                              }
+                            : d,
+                        "gesture:webcam",
+                      )
+                    }
+                  >
+                    <ZoomOut className="size-3.5" />
+                    Zoom Out
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={(doc.viral.webcamBox.zoom ?? 1) >= 2.5}
+                    data-testid="inspector-webcam-zoom-in"
+                    onClick={() =>
+                      update(
+                        (d) =>
+                          d.viral
+                            ? {
+                                ...d,
+                                viral: {
+                                  ...d.viral,
+                                  webcamBox: {
+                                    ...d.viral.webcamBox,
+                                    zoom:
+                                      Math.round(
+                                        clamp((d.viral.webcamBox.zoom ?? 1) + 0.15, 0.5, 2.5) * 100,
+                                      ) / 100,
+                                  },
+                                },
+                              }
+                            : d,
+                        "gesture:webcam",
+                      )
+                    }
+                  >
+                    <ZoomIn className="size-3.5" />
+                    Zoom In
+                  </Button>
+                </div>
+              </Section>
+            )}
           </TabsContent>
           <TabsContent value="broll" className="p-4">
             <BRollPanel

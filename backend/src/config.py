@@ -34,6 +34,24 @@ class Config:
         self.llm = self._get_runtime_setting("LLM") or self._infer_default_llm()
         # Optional separate model for the cross-window candidate rerank pass.
         self.rerank_llm = self._get_optional_env("RERANK_LLM") or self.llm
+        raw_fallbacks = self._get_optional_env("LLM_FALLBACK_MODELS") or ""
+        self.llm_fallback_models = [
+            item.strip() for item in raw_fallbacks.split(",") if item.strip()
+        ]
+        # Optional free-tier pacing and windowing overrides (0 = disabled).
+        self.llm_max_rpm = max(0, self._get_int_env("LLM_MAX_RPM", 0))
+        self.llm_min_interval_seconds = max(
+            0.0, float(os.getenv("LLM_MIN_INTERVAL_SECONDS", "0") or 0)
+        )
+        self.analysis_window_concurrency = max(
+            1, self._get_int_env("ANALYSIS_WINDOW_CONCURRENCY", 3)
+        )
+        self.analysis_window_seconds = max(
+            60, self._get_int_env("ANALYSIS_WINDOW_SECONDS", 12 * 60)
+        )
+        self.analysis_single_window_max_seconds = max(
+            60, self._get_int_env("ANALYSIS_SINGLE_WINDOW_MAX_SECONDS", 15 * 60)
+        )
         self.assembly_ai_api_key = self._get_runtime_setting("ASSEMBLY_AI_API_KEY")
         # An explicit deployment choice overrides the model for every processing mode.
         self.assembly_ai_speech_model = os.getenv("ASSEMBLY_AI_SPEECH_MODEL", "").strip()
@@ -202,6 +220,16 @@ class Config:
 
         self.self_host = self._get_bool_env("SELF_HOST", True)
         self.monetization_enabled = not self.self_host
+        if self.self_host and "PYTEST_CURRENT_TEST" not in os.environ:
+            self.max_video_duration = max(self.max_video_duration, 14400)
+            self.pro_youtube_max_video_duration = max(self.pro_youtube_max_video_duration, 14400)
+            self.scale_youtube_max_video_duration = max(self.scale_youtube_max_video_duration, 14400)
+            self.max_clips = max(self.max_clips, 20)
+            self.fast_mode_max_clips = max(int(os.getenv("FAST_MODE_MAX_CLIPS", "20")), 20)
+            self.youtube_download_max_bytes = max(self.youtube_download_max_bytes, 10_000_000_000)
+            self.assembly_ai_http_timeout_seconds = max(self.assembly_ai_http_timeout_seconds, 1800)
+            self.stream_download_max_seconds = max(self.stream_download_max_seconds, 5400)
+            self.processing_task_timeout_seconds = max(self.processing_task_timeout_seconds, 18000)
         self.backend_auth_secret = self._get_optional_env("BACKEND_AUTH_SECRET")
         # Shared with the MCP server; enables its OAuth endpoints (/internal/mcp-oauth).
         self.mcp_oauth_secret = self._get_optional_env("MCP_OAUTH_SECRET")
@@ -345,6 +373,8 @@ class Config:
         )
         self.default_processing_mode = os.getenv("DEFAULT_PROCESSING_MODE", "fast")
         self.fast_mode_max_clips = int(os.getenv("FAST_MODE_MAX_CLIPS", "10"))
+        if self.self_host and "PYTEST_CURRENT_TEST" not in os.environ:
+            self.fast_mode_max_clips = max(self.fast_mode_max_clips, 20)
         self.fast_mode_transcript_model = os.getenv(
             "FAST_MODE_TRANSCRIPT_MODEL", "universal-3-5-pro"
         )

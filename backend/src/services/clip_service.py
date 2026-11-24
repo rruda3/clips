@@ -573,6 +573,168 @@ class ClipEditingMixin:
         )
         return (await self.clip_repo.get_clip_by_id(self.db, clip_id)) or {}
 
+    @serialized_task_edit
+    async def extend_clip(
+        self,
+        task_id: str,
+        clip_id: str,
+        before_seconds: float = 0.0,
+        after_seconds: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Extend an existing clip backwards/forwards using the cached or remote source video."""
+        before = max(0.0, min(60.0, float(before_seconds or 0.0)))
+        after = max(0.0, min(60.0, float(after_seconds or 0.0)))
+        if before <= 0.01 and after <= 0.01:
+            raise ValueError("Specify before_seconds or after_seconds greater than 0")
+
+        clip = await self.clip_repo.get_clip_by_id(self.db, clip_id)
+        if not clip or clip["task_id"] != task_id:
+            raise ValueError("Clip not found")
+
+        task = await self.task_repo.get_task_by_id(self.db, task_id)
+        if not task:
+            raise ValueError("Task not found")
+
+        source_url = task.get("source_url")
+        source_type = task.get("source_type")
+        if not source_url or not source_type:
+            raise ValueError("Task source URL is missing; cannot extend clip")
+
+        source_ranges = await run_in_thread(self._get_clip_source_ranges, clip)
+        if not source_ranges:
+            raise ValueError("Clip source boundaries unavailable")
+
+        metadata = await self._load_task_source_settings(task_id)
+        max_dur = float(task.get("source_duration_seconds") or 0.0)
+        new_start = max(0.0, float(source_ranges[0][0]) - before)
+        new_end = float(source_ranges[-1][1]) + after
+        if max_dur > 0:
+            new_end = min(max_dur, new_end)
+
+        applied_before = round(float(source_ranges[0][0]) - new_start, 3)
+        applied_after = round(new_end - float(source_ranges[-1][1]), 3)
+        if applied_before <= 0.01 and applied_after <= 0.01:
+            raise ValueError("Clip is already at the source boundaries")
+
+        extended_ranges = [tuple(r) for r in source_ranges]
+        extended_ranges[0] = (new_start, extended_ranges[0][1])
+        extended_ranges[-1] = (extended_ranges[-1][0], new_end)
+        normalized_extended = normalize_source_ranges(extended_ranges)
+
+        download_quality, output_short_side = await self._media_limits(task.get("user_id"))
+        output_format = metadata.get("output_format", "vertical")
+        add_subtitles = metadata.get("add_subtitles", True)
+        cleanup_settings = normalize_clip_cleanup_settings(
+            metadata.get("cut_long_pauses"),
+            metadata.get("pause_threshold_ms"),
+            metadata.get("remove_filler_words"),
+            metadata.get("filtered_words"),
+            gameplay_mode=metadata.get("gameplay_mode"),
+            webcam_position=metadata.get("webcam_position"),
+        )
+        if metadata.get("resolved_webcam_box"):
+            cleanup_settings["resolved_webcam_box"] = metadata["resolved_webcam_box"]
+
+        segment = {
+            "start_time": self._seconds_to_mmss(new_start),
+            "end_time": self._seconds_to_mmss(new_end),
+            "keep_ranges": normalized_extended,
+            "source_ranges": normalized_extended,
+            "text": clip.get("text") or "",
+            "relevance_score": clip.get("relevance_score", 0.5),
+            "reasoning": clip.get("reasoning") or "Extended clip",
+            "virality_score": clip.get("virality_score", 0),
+            "hook_score": clip.get("hook_score", 0),
+            "engagement_score": clip.get("engagement_score", 0),
+            "value_score": clip.get("value_score", 0),
+            "shareability_score": clip.get("shareability_score", 0),
+            "hook_type": clip.get("hook_type"),
+            "hook_title": clip.get("hook_title"),
+            "broll": [],
+        }
+
+        video_path: Path
+        if source_type == "youtube":
+            downloaded = await self.video_service.download_video(
+                source_url,
+                quality=download_quality,
+                task_id=task_id,
+                ranges=ranges_from_segments([segment]),
+            )
+            if not downloaded:
+                raise ValueError("Failed to fetch source video for extension")
+            video_path = Path(downloaded)
+        elif source_type in {"twitch", "kick"}:
+            video_path = await run_stream_download(
+                download_stream_sections,
+                source_url,
+                [{"start_time": new_start, "end_time": new_end}],
+                task.get("source_duration_seconds"),
+                task_id,
+            )
+        else:
+            video_path = await resolve_upload_for_edit(self.video_service, source_url)
+            if not video_path.exists():
+                raise ValueError("Source video file no longer exists")
+
+        try:
+            video_path = await self.video_service.prepare_source(video_path)
+            time_map = await run_in_thread(load_time_map, video_path)
+            if not time_map:
+                actual_dur = await run_in_thread(ffprobe_duration, video_path)
+                if actual_dur > 0 and normalized_extended[-1][1] > actual_dur:
+                    clamped_end = min(actual_dur, normalized_extended[-1][1])
+                    applied_after = round(max(0.0, clamped_end - float(source_ranges[-1][1])), 3)
+                    normalized_extended[-1] = (normalized_extended[-1][0], clamped_end)
+                    segment["end_time"] = self._seconds_to_mmss(clamped_end)
+                    segment["keep_ranges"] = normalized_extended
+                    segment["source_ranges"] = normalized_extended
+            render_segment = localize_segment(segment, time_map) if time_map else segment
+            total_span = sum(e - s for s, e in normalized_extended)
+            clips_info = await self.video_service.create_video_clips(
+                video_path,
+                [render_segment],
+                task.get("font_family"),
+                task.get("font_size"),
+                task.get("font_color"),
+                task.get("caption_template") or "default",
+                output_format,
+                add_subtitles,
+                cleanup_settings,
+                max_short_side=output_short_side,
+                max_clip_seconds=max(
+                    clip_duration(normalize_clip_length(metadata.get("clip_length"))).maximum,
+                    MAX_RENDERED_CLIP_SECONDS,
+                    total_span + 5.0,
+                ),
+                include_broll=False,
+            )
+            if not clips_info:
+                raise ValueError("Failed to render extended clip")
+            clip_info = clips_info[0]
+            if time_map:
+                await run_in_thread(restore_clip_timeline, clip_info, time_map, segment)
+        finally:
+            if source_type in {"youtube", "twitch", "kick"} and "video_path" in locals():
+                self._cleanup_source_video(video_path, source_type, source_url)
+
+        await self.clip_repo.update_clip(
+            self.db,
+            clip_id,
+            clip_info["filename"],
+            clip_info["path"],
+            clip_info["start_time"],
+            clip_info["end_time"],
+            clip_info["duration"],
+            clip_info.get("text") or clip.get("text") or "",
+        )
+        updated_clip = (await self.clip_repo.get_clip_by_id(self.db, clip_id)) or {}
+        return {
+            "clip": updated_clip,
+            "applied_before": applied_before,
+            "applied_after": applied_after,
+        }
+
 
     @serialized_task_edit
     async def split_clip(
@@ -1012,6 +1174,7 @@ class ClipEditingMixin:
         if not isinstance(add_subtitles, bool):
             add_subtitles = defaults["add_subtitles"]
 
+        resolved_wb = parsed.get("resolved_webcam_box")
         return {
             "output_format": output_format,
             "add_subtitles": add_subtitles,
@@ -1021,5 +1184,8 @@ class ClipEditingMixin:
                 parsed.get("pause_threshold_ms"),
                 parsed.get("remove_filler_words"),
                 parsed.get("filtered_words"),
+                gameplay_mode=parsed.get("gameplay_mode", False),
+                webcam_position=parsed.get("webcam_position"),
             ),
+            **({"resolved_webcam_box": resolved_wb} if isinstance(resolved_wb, dict) else {}),
         }

@@ -5,6 +5,7 @@ import {
   captionTransform,
   frameRect,
   hookRange,
+  isSourceSpanActive,
   mappedWords,
   outputSize,
   replaceWords,
@@ -166,25 +167,205 @@ export interface BRollLayer {
   draw: (x: number, y: number, width: number, height: number) => void;
 }
 
+export interface SourceCropRect {
+  sx: number;
+  sy: number;
+  sw: number;
+  sh: number;
+}
+
+function coverCropForBox(
+  sx: number,
+  sy: number,
+  sw: number,
+  sh: number,
+  dw: number,
+  dh: number,
+): SourceCropRect {
+  const srcAspect = sw / Math.max(1, sh);
+  const dstAspect = dw / Math.max(1, dh);
+  if (srcAspect > dstAspect) {
+    const cropW = sh * dstAspect;
+    return { sx: sx + (sw - cropW) / 2, sy, sw: cropW, sh };
+  }
+  const cropH = sw / dstAspect;
+  return { sx, sy: sy + (sh - cropH) / 2, sw, sh: cropH };
+}
+
+export function resolveWebcamCropRect(
+  wb: EditDocument["viral"] extends infer V
+    ? V extends { webcamBox: infer W }
+      ? W | null | undefined
+      : never
+    : never,
+  sourceWidth: number,
+  sourceHeight: number,
+): { x: number; y: number; w: number; h: number } {
+  if (!wb) {
+    return {
+      x: 0,
+      y: 0,
+      w: Math.max(4, sourceWidth * 0.28),
+      h: Math.max(4, sourceHeight * 0.34),
+    };
+  }
+  const camZoom = Math.max(0.5, Math.min(2.5, wb.zoom ?? 1));
+  const baseW = Math.max(4, Math.min(sourceWidth, wb.w * sourceWidth));
+  const baseH = Math.max(4, Math.min(sourceHeight, wb.h * sourceHeight));
+  const rawX = Math.max(0, Math.min(sourceWidth - baseW, wb.x * sourceWidth));
+  const rawY = Math.max(0, Math.min(sourceHeight - baseH, wb.y * sourceHeight));
+  const midX = rawX + baseW / 2;
+  const midY = rawY + baseH / 2;
+  const camW = Math.max(4, Math.min(sourceWidth, baseW / camZoom));
+  const camH = Math.max(4, Math.min(sourceHeight, baseH / camZoom));
+  const camX = Math.max(0, Math.min(sourceWidth - camW, midX - camW / 2));
+  const camY = Math.max(0, Math.min(sourceHeight - camH, midY - camH / 2));
+  return { x: camX, y: camY, w: camW, h: camH };
+}
+
 export function drawEditorFrame(
   ctx: CanvasRenderingContext2D,
   doc: EditDocument,
   sourceWidth: number,
   sourceHeight: number,
   time: number,
-  draw: (rect: ReturnType<typeof frameRect>) => void,
+  draw: (rect: ReturnType<typeof frameRect>, srcCrop?: SourceCropRect) => void,
   looks?: Record<string, CaptionLook>,
   broll?: BRollLayer | null,
   textLayers: "all" | "none" = "all",
 ) {
   const { width, height } = ctx.canvas,
-    fx = doc.effects;
+    fx = doc.effects,
+    viral = doc.viral;
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = "black";
   ctx.fillRect(0, 0, width, height);
   ctx.save();
-  ctx.filter = `brightness(${fx.brightness}%) contrast(${fx.contrast}%) saturate(${fx.saturation}%) blur(${(fx.blur * width) / 1080}px) hue-rotate(${fx.hue}deg)`;
-  draw(frameRect(doc.framing, sourceWidth, sourceHeight, width, height));
+
+  let isGrayscale = false;
+  let inFreezeBw = false;
+  let dynamicZoom = 1;
+  let shakeX = 0;
+  let shakeY = 0;
+
+  if (viral) {
+    for (const te of viral.timeEffects ?? []) {
+      if (te.kind === "freeze_bw" && isSourceSpanActive(doc, te.start, te.end, time)) {
+        isGrayscale = true;
+        inFreezeBw = true;
+        dynamicZoom = Math.max(dynamicZoom, 1.12);
+      }
+    }
+    for (const kf of viral.cameraKeyframes ?? []) {
+      if (isSourceSpanActive(doc, kf.start, kf.end, time)) {
+        if (kf.mode === "bw_dramatic") isGrayscale = true;
+        else if (kf.mode === "punch") dynamicZoom = Math.max(dynamicZoom, kf.zoom || 1.22);
+        else if (kf.mode === "slow_tension") {
+          const spanLen = Math.max(0.1, kf.end - kf.start);
+          const progress = Math.min(1, Math.max(0, ((time - kf.start) % spanLen + spanLen) / spanLen));
+          dynamicZoom = Math.max(dynamicZoom, 1 + ((kf.zoom || 1.2) - 1) * progress);
+        } else if (kf.mode === "shake") {
+          dynamicZoom = Math.max(dynamicZoom, kf.zoom || 1.15);
+          const amp = (kf.intensity || 0.6) * (width / 1080) * 18;
+          shakeX = Math.sin(time * 75) * amp;
+          shakeY = Math.cos(time * 65) * amp;
+        }
+      }
+    }
+  }
+
+  const sat = isGrayscale ? 0 : fx.saturation;
+  const con = isGrayscale ? Math.min(180, fx.contrast * 1.22) : fx.contrast;
+  ctx.filter = `brightness(${fx.brightness}%) contrast(${con}%) saturate(${sat}%) blur(${(fx.blur * width) / 1080}px) hue-rotate(${fx.hue}deg)`;
+
+  if (dynamicZoom > 1.001 || shakeX !== 0 || shakeY !== 0) {
+    ctx.translate(width / 2 + shakeX, height / 2 + shakeY);
+    ctx.scale(dynamicZoom, dynamicZoom);
+    ctx.translate(-width / 2, -height / 2);
+  }
+
+  const { x: camX, y: camY, w: camW, h: camH } = resolveWebcamCropRect(
+    viral?.webcamBox,
+    sourceWidth,
+    sourceHeight,
+  );
+  const canLayoutLandscape = Boolean(viral && sourceWidth > sourceHeight);
+
+  if (viral?.layoutMode === "split" && canLayoutLandscape) {
+    if (width <= height) {
+      const topH = Math.round(height * (width === height ? 0.38 : 1 / 3));
+      const botH = height - topH;
+      draw(
+        { x: 0, y: 0, width, height: topH },
+        coverCropForBox(camX, camY, camW, camH, width, topH),
+      );
+      draw(
+        { x: 0, y: topH, width, height: botH },
+        coverCropForBox(0, 0, sourceWidth, sourceHeight, width, botH),
+      );
+      ctx.save();
+      ctx.filter = "none";
+      ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+      ctx.fillRect(0, topH - 2, width, 4);
+      ctx.restore();
+    } else {
+      const leftW = Math.round(width * 0.34);
+      const rightW = width - leftW;
+      draw(
+        { x: 0, y: 0, width: leftW, height },
+        coverCropForBox(camX, camY, camW, camH, leftW, height),
+      );
+      draw(
+        { x: leftW, y: 0, width: rightW, height },
+        coverCropForBox(0, 0, sourceWidth, sourceHeight, rightW, height),
+      );
+      ctx.save();
+      ctx.filter = "none";
+      ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+      ctx.fillRect(leftW - 2, 0, 4, height);
+      ctx.restore();
+    }
+  } else if (viral?.layoutMode === "fullscreen_cam" && canLayoutLandscape) {
+    draw(
+      { x: 0, y: 0, width, height },
+      coverCropForBox(camX, camY, camW, camH, width, height),
+    );
+  } else if (viral?.layoutMode === "pip" && canLayoutLandscape) {
+    draw(frameRect(doc.framing, sourceWidth, sourceHeight, width, height));
+    const pipW = Math.max(80, Math.round(width * 0.30));
+    const pipH = Math.max(60, Math.round(pipW * 0.78));
+    const pipX = Math.max(12, Math.round(width * 0.04));
+    const pipY = Math.max(12, height - pipH - Math.round(height * 0.11));
+    ctx.save();
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    ctx.fillRect(pipX - 3, pipY - 3, pipW + 6, pipH + 6);
+    draw(
+      { x: pipX, y: pipY, width: pipW, height: pipH },
+      coverCropForBox(camX, camY, camW, camH, pipW, pipH),
+    );
+    ctx.restore();
+  } else {
+    draw(frameRect(doc.framing, sourceWidth, sourceHeight, width, height));
+  }
+
+  if (inFreezeBw) {
+    ctx.save();
+    ctx.filter = "none";
+    const grad = ctx.createRadialGradient(
+      width / 2,
+      height / 2,
+      width * 0.25,
+      width / 2,
+      height / 2,
+      height * 0.7,
+    );
+    grad.addColorStop(0, "rgba(0,0,0,0)");
+    grad.addColorStop(1, "rgba(0,0,0,0.45)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, width, height);
+    ctx.restore();
+  }
+
   ctx.restore();
   if (broll && broll.alpha > 0 && broll.width > 0 && broll.height > 0) {
     // Fill the frame (cover), centred, as the export's scale+crop does.
@@ -212,7 +393,43 @@ export function drawEditorTextLayer(
   if (layer !== "hook" && doc.captions.enabled) drawCaptions(ctx, doc, out, time, look, draft?.captionWords);
   const hookDocument = draft?.hookText === undefined ? doc : { ...doc, hookTitle: draft.hookText };
   if (layer !== "captions" && hookDocument.hookTitle?.trim()) drawHookTitle(ctx, hookDocument, out, time, look);
+  if ((layer === "hook" || layer === "all") && doc.viral?.subtexts?.length) drawViralSubtexts(ctx, doc, out, time);
   ctx.restore();
+}
+
+function drawViralSubtexts(
+  ctx: CanvasRenderingContext2D,
+  doc: EditDocument,
+  { width, height }: { width: number; height: number },
+  time: number,
+) {
+  const subtexts = doc.viral?.subtexts ?? [];
+  for (const sub of subtexts) {
+    if (!isSourceSpanActive(doc, sub.start, sub.end, time)) continue;
+    const x = sub.x * width;
+    const y = sub.y * height;
+    ctx.save();
+    const fontPx = Math.max(28, Math.round((46 * width) / 1080));
+    ctx.font = `${sub.variant === "thought" ? "italic " : ""}800 ${fontPx}px "Editor-${doc.captions.font}", sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const metrics = ctx.measureText(sub.text);
+    const padX = 24;
+    const padY = 14;
+    if (sub.variant === "censor_bar") {
+      ctx.fillStyle = "#000000";
+      ctx.fillRect(x - metrics.width / 2 - padX, y - fontPx / 2 - padY, metrics.width + padX * 2, fontPx + padY * 2);
+      ctx.fillStyle = "#FF4D4D";
+      ctx.fillText(sub.text, x, y);
+    } else {
+      ctx.lineWidth = 8;
+      ctx.strokeStyle = "#000000";
+      ctx.strokeText(sub.text, x, y);
+      ctx.fillStyle = sub.color || "#FACC15";
+      ctx.fillText(sub.text, x, y);
+    }
+    ctx.restore();
+  }
 }
 
 function drawCaptions(

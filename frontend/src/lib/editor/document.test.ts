@@ -13,7 +13,13 @@ import {
   setCaptionVisualSize,
   renderSegments,
   splitSegment,
+  locateOutputTime,
+  trimStartAt,
+  trimEndAt,
+  deleteSegmentAt,
+  cutOutputRange,
 } from "./document";
+import { resolveWebcamCropRect } from "./render";
 import { draft } from "./document.test-fixture";
 
 it("keeps placements local to a caption occurrence across splits and repeated footage", () => {
@@ -142,5 +148,46 @@ describe("non-destructive edits", () => {
     expect(activeWordIndex(group, 0.9)).toBe(0);
     expect(activeWordIndex(group, 1)).toBe(1);
     expect(activeWordIndex(group, 2.4)).toBe(2);
+  });
+  it("resolves webcam 0..100% bounds and zoom in/out crop dimensions", () => {
+    const edge = resolveWebcamCropRect({ x: 1, y: 1, w: 0.25, h: 0.25, zoom: 1 }, 1920, 1080);
+    expect(edge.w).toBe(480);
+    expect(edge.h).toBe(270);
+    expect(edge.x + edge.w).toBeLessThanOrEqual(1920);
+    expect(edge.y + edge.h).toBeLessThanOrEqual(1080);
+
+    const base = resolveWebcamCropRect({ x: 0.4, y: 0.4, w: 0.2, h: 0.2, zoom: 1 }, 1920, 1080);
+    const zoomedIn = resolveWebcamCropRect({ x: 0.4, y: 0.4, w: 0.2, h: 0.2, zoom: 2 }, 1920, 1080);
+    const zoomedOut = resolveWebcamCropRect({ x: 0.4, y: 0.4, w: 0.2, h: 0.2, zoom: 0.5 }, 1920, 1080);
+    expect(zoomedIn.w).toBeLessThan(base.w);
+    expect(base.w).toBeLessThan(zoomedOut.w);
+  });
+  it("supports quick-cut operations: split, trim start/end, delete segment, and cut range A->B", () => {
+    const base = { ...draft, segments: [{ id: "s0", start: 0, end: 20 }] };
+    // Cut a middle section [5, 11] -> leaves [0, 5] and [11, 20] (total 14s)
+    const cutMid = cutOutputRange(base, 5, 11);
+    expect(cutMid.segments).toHaveLength(2);
+    expect(cutMid.segments[0]).toMatchObject({ start: 0, end: 5 });
+    expect(cutMid.segments[1]).toMatchObject({ start: 11, end: 20 });
+    expect(editDuration(cutMid)).toBeCloseTo(14);
+
+    // Locate output time inside the second segment (out=7 -> source=13)
+    const loc = locateOutputTime(cutMid, 7);
+    expect(loc.segmentIndex).toBe(1);
+    expect(loc.sourceTime).toBeCloseTo(13);
+
+    // Trim start to out=7 (seg 1, source 13) drops seg 0 and starts at 13
+    const trimmedStart = trimStartAt(cutMid, loc.segmentIndex, loc.sourceTime);
+    expect(trimmedStart.segments).toHaveLength(1);
+    expect(trimmedStart.segments[0]).toMatchObject({ start: 13, end: 20 });
+
+    // Trim end on base at source=12 keeps [0, 12]
+    const trimmedEnd = trimEndAt(base, 0, 12);
+    expect(trimmedEnd.segments).toHaveLength(1);
+    expect(trimmedEnd.segments[0]).toMatchObject({ start: 0, end: 12 });
+
+    // Delete segment keeps at least one segment
+    expect(deleteSegmentAt(cutMid, 0).segments).toHaveLength(1);
+    expect(deleteSegmentAt(base, 0).segments).toHaveLength(1);
   });
 });

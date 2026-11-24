@@ -279,6 +279,7 @@ def create_optimized_clip(
     broll_overlays: Optional[List[Dict[str, Any]]] = None,
     output_offsets: Optional[List[float]] = None,
     point_labels: Optional[List[Dict[str, Any]]] = None,
+    cleanup_settings: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Create clip with optional subtitles. output_format: 'vertical' (9:16) or 'original' (keep source size).
 
@@ -424,9 +425,13 @@ def create_optimized_clip(
                     except Exception as exc:
                         logger.warning("Speaker turn extraction failed: %s", exc)
                 try:
+                    vf_kwargs: Dict[str, Any] = {"report": plan_report}
+                    if cleanup_settings and cleanup_settings.get("gameplay_mode"):
+                        vf_kwargs["gameplay_mode"] = True
+                        vf_kwargs["gameplay_webcam_box"] = cleanup_settings.get("resolved_webcam_box")
                     video_filter, mode, caption_y = build_vertical_filter_plan(
                         source_clip_path, src_w, src_h, speaker_turns, speaker_words,
-                        report=plan_report,
+                        **vf_kwargs,
                     )
                     vertical_plan = (video_filter, mode)
                 except Exception as exc:
@@ -610,6 +615,7 @@ def create_clips_from_segments(
                 broll_overlays=segment.get("broll_overlays"),
                 **({"output_offsets": output_offsets} if output_offsets is not None else {}),
                 **({"point_labels": point_labels} if point_labels else {}),
+                **({"cleanup_settings": cleanup_settings} if cleanup_settings and cleanup_settings.get("gameplay_mode") else {}),
             )
 
             if success:

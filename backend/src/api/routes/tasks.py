@@ -1167,6 +1167,7 @@ async def delete_clip(
 
 
 @router.get("/{task_id}/clips/{clip_id}/file")
+@router.get("/{task_id}/clips/{clip_id}/download")
 async def get_clip_file(
     task_id: str,
     clip_id: str,
@@ -1314,6 +1315,39 @@ async def trim_clip(
     except Exception as e:
         logger.error(f"Error trimming clip: {e}")
         raise HTTPException(status_code=500, detail=f"Error trimming clip: {str(e)}")
+
+
+@router.post("/{task_id}/clips/{clip_id}/extend")
+async def extend_clip(
+    task_id: str, clip_id: str, request: Request, db: AsyncSession = Depends(get_db)
+):
+    """Extend clip boundaries backwards/forwards using the cached or remote source video."""
+    try:
+        payload = await _read_json_object(request)
+        before_seconds = _finite_number(payload.get("before_seconds", 0), "before_seconds")
+        after_seconds = _finite_number(payload.get("after_seconds", 0), "after_seconds")
+
+        if before_seconds < 0 or after_seconds < 0:
+            raise HTTPException(
+                status_code=400, detail="before_seconds and after_seconds must be non-negative"
+            )
+        if before_seconds <= 0 and after_seconds <= 0:
+            raise HTTPException(
+                status_code=400, detail="Specify before_seconds or after_seconds greater than 0"
+            )
+
+        task_service = TaskService(db)
+        await _require_task_owner(request, task_service, db, task_id)
+        return await task_service.extend_clip(
+            task_id, clip_id, before_seconds=before_seconds, after_seconds=after_seconds
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error extending clip: {e}")
+        raise HTTPException(status_code=500, detail=f"Error extending clip: {str(e)}")
 
 
 @router.post("/{task_id}/clips/{clip_id}/split")
@@ -1689,6 +1723,8 @@ async def resume_task(
                 metadata.get("pause_threshold_ms"),
                 metadata.get("remove_filler_words"),
                 metadata.get("filtered_words"),
+                gameplay_mode=metadata.get("gameplay_mode"),
+                webcam_position=metadata.get("webcam_position"),
             )
 
             if not source_url or not source_type:
@@ -1801,3 +1837,51 @@ async def list_dead_letter_tasks(request: Request, db: AsyncSession = Depends(ge
         return {"total": len(items), "tasks": items}
     finally:
         await redis_client.aclose()
+
+
+@router.get("/cache/videos")
+async def get_cached_videos(request: Request, db: AsyncSession = Depends(get_db)):
+    """List cached source videos on disk with sizes and active-task lock status."""
+    from ...services.video_cache_service import list_cached_videos
+
+    config = get_config()
+    user_id = await resolve_authenticated_user_id(request, db, config)
+    is_admin = await user_is_admin(db, user_id)
+    return await list_cached_videos(db, user_id=user_id, is_admin=is_admin)
+
+
+@router.post("/cache/videos/clear")
+async def post_clear_cached_videos(request: Request, db: AsyncSession = Depends(get_db)):
+    """Delete all unused cached source videos to free storage."""
+    from ...services.video_cache_service import clear_unused_video_cache
+
+    config = get_config()
+    user_id = await resolve_authenticated_user_id(request, db, config)
+    is_admin = await user_is_admin(db, user_id)
+    return await clear_unused_video_cache(db, user_id=user_id, is_admin=is_admin)
+
+
+@router.delete("/cache/videos/{cache_id}")
+async def delete_single_cached_video(
+    cache_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete one cached source video directory/upload group from disk."""
+    from ...services.video_cache_service import delete_cached_video
+
+    config = get_config()
+    user_id = await resolve_authenticated_user_id(request, db, config)
+    is_admin = await user_is_admin(db, user_id)
+    try:
+        return await delete_cached_video(
+            db, cache_id=cache_id, user_id=user_id, is_admin=is_admin
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))

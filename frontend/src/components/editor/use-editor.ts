@@ -45,6 +45,8 @@ function upgradeCachedHistory(history: History, server: EditDocument): History {
       ? { textTransforms: structuredClone(document.textTransforms ?? {}) } : {}),
     ...(document.captionTransforms !== undefined || server.captionTransforms !== undefined
       ? { captionTransforms: Object.fromEntries(Object.entries(document.captionTransforms ?? {}).map(([key, value]) => [key, { ...value, size: value.size ?? null }])) } : {}),
+    ...(document.viral !== undefined || server.viral !== undefined
+      ? { viral: structuredClone(document.viral ?? null) } : {}),
   });
   return {
     past: history.past.map(upgrade),

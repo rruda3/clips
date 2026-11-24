@@ -2,6 +2,8 @@
   "nav": {
     "create": "Crear",
     "library": "Biblioteca",
+    "tiktokStudio": "Estudio TikTok",
+    "cache": "Videos en Caché",
     "social": "Redes",
     "analytics": "Analíticas",
     "agents": "Agentes y API",

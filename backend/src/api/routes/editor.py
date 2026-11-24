@@ -22,7 +22,11 @@ from ...editor_state import (
     reap_jobs,
     render_job_id,
 )
-from ...services.editor_service import caption_looks, upgrade_document
+from ...services.editor_service import (
+    caption_looks,
+    needs_gameplay_landscape_restore,
+    upgrade_document,
+)
 from ...services.task_service import TaskService
 from ...services.ai_edit_allowance_service import (
     AIEditAllowanceService, AIEditLimitExceeded, refund_ai_edit_usage,
@@ -34,12 +38,20 @@ from .tasks import _require_task_owner, _read_json_object
 router = APIRouter(prefix="/tasks", tags=["editor"])
 
 
+async def _with_source_settings(service, task_id: str, task: dict) -> dict:
+    loader = getattr(service, "_load_task_source_settings", None)
+    if callable(loader):
+        return {**task, **(await loader(task_id))}
+    return task
+
+
 async def owned_context(request, db, task_id, clip_id):
     service = TaskService(db)
     task = await _require_task_owner(request, service, db, task_id)
     clip = await service.clip_repo.get_clip_by_id(db, clip_id)
     if not clip or clip["task_id"] != task_id:
         raise HTTPException(404, "Clip not found")
+    task = await _with_source_settings(service, task_id, task)
     await db.close()
     session = await open_session(service.config.temp_dir, task_id, clip)
     return task, clip, session
@@ -87,26 +99,72 @@ async def _stored_media(storage: MediaStorage, session, name: str, download_name
     return None
 
 
+async def _maybe_restore_gameplay_landscape(
+    task_id: str, task: dict, clip: dict, session, state: dict
+) -> dict | None:
+    if not needs_gameplay_landscape_restore(task, state):
+        return None
+    store = get_store()
+    job = f"editor-prepare:{uuid.uuid4().hex}"
+    revision = (state.get("draft") or {}).get("revision")
+    if isinstance(revision, int) and await store.rebuild(session.key, revision, job) == "claimed":
+        await _enqueue_prepare(store, session, task_id, clip, job)
+        return await session.state()
+    return None
+
+
 @router.get("/{task_id}/clips/{clip_id}/editor")
 async def get_editor(
     task_id: str, clip_id: str, request: Request, db: AsyncSession = Depends(get_db)
 ):
     task, clip, session = await owned_context(request, db, task_id, clip_id)
     state = await session.state()
-    if state.get("status") == "ready":
+    if (
+        state.get("status") == "ready"
+        and isinstance(state.get("draft"), dict)
+        and isinstance(state.get("original"), dict)
+    ):
+        rebuilt = await _maybe_restore_gameplay_landscape(task_id, task, clip, session, state)
+        if rebuilt is not None:
+            state = rebuilt
+    if (
+        state.get("status") == "ready"
+        and isinstance(state.get("draft"), dict)
+        and isinstance(state.get("original"), dict)
+    ):
         draft = state["draft"]
         placements = []
         if "broll" not in draft["document"] or "broll" not in state["original"]:
             placements = await run_in_thread(_clip_broll, clip)
-        draft["document"] = upgrade_document(draft["document"], clip, task, placements, state["duration"])
-        state["original"] = upgrade_document(state["original"], clip, task, placements, state["duration"])
+        draft["document"] = upgrade_document(
+            draft["document"],
+            clip,
+            task,
+            placements,
+            state["duration"],
+            source_width=state.get("width"),
+            source_height=state.get("height"),
+        )
+        state["original"] = upgrade_document(
+            state["original"],
+            clip,
+            task,
+            placements,
+            state["duration"],
+            source_width=state.get("width"),
+            source_height=state.get("height"),
+        )
         state["captionLooks"] = caption_looks()
         from ...services.ai_edit_service import ai_editing_configured
 
         state["aiEditing"] = ai_editing_configured()
         if state["aiEditing"]:
             state["aiEditUsage"] = await AIEditAllowanceService(db).summary(task["user_id"])
-    if state.get("status") == "ready":
+    if (
+        state.get("status") == "ready"
+        and isinstance(state.get("draft"), dict)
+        and isinstance(state.get("original"), dict)
+    ):
         incomplete = await run_in_thread(_incomplete_source, clip, state)
         if incomplete:
             state["sourceIncomplete"] = incomplete
@@ -215,8 +273,12 @@ async def draft_backup(
 async def prepare(
     task_id: str, clip_id: str, request: Request, db: AsyncSession = Depends(get_db)
 ):
-    clip, session = await context(request, db, task_id, clip_id)
+    task, clip, session = await owned_context(request, db, task_id, clip_id)
     state = await session.state()
+    if state["status"] == "ready":
+        rebuilt = await _maybe_restore_gameplay_landscape(task_id, task, clip, session, state)
+        if rebuilt is not None:
+            return {"status": rebuilt.get("status", "preparing")}
     if state["status"] in {"ready", "preparing"}:
         return {"status": state["status"]}
     store = get_store()
@@ -395,6 +457,7 @@ async def export_file(
 async def combine(task_id: str, request: Request, db: AsyncSession = Depends(get_db)):
     service = TaskService(db)
     task = await _require_task_owner(request, service, db, task_id)
+    task = await _with_source_settings(service, task_id, task)
     payload = await _read_json_object(request)
     ids = payload.get("clip_ids")
     if (
@@ -427,7 +490,13 @@ async def combine(task_id: str, request: Request, db: AsyncSession = Depends(get
                 "id": clip_id,
                 "filename": clip["filename"],
                 "document": upgrade_document(
-                    state["draft"]["document"], clip, task, placements, state["duration"]
+                    state["draft"]["document"],
+                    clip,
+                    task,
+                    placements,
+                    state["duration"],
+                    source_width=state.get("width"),
+                    source_height=state.get("height"),
                 ),
                 "state": {k: state[k] for k in ("width", "height", "hasAudio", "mediaVersion") if k in state},
                 "ranges": source_ranges,
@@ -580,6 +649,7 @@ async def ai_edit_usage(
 ):
     service = TaskService(db)
     task = await _require_task_owner(request, service, db, task_id)
+    task = await _with_source_settings(service, task_id, task)
     clip = await service.clip_repo.get_clip_by_id(db, clip_id)
     if not clip or clip["task_id"] != task_id:
         raise HTTPException(404, "Clip not found")
@@ -684,6 +754,7 @@ async def ai_edit_status(
         raise HTTPException(404, "AI edit not found")
     service = TaskService(db)
     task = await _require_task_owner(request, service, db, task_id)
+    task = await _with_source_settings(service, task_id, task)
     await db.close()
     pool = await JobQueue.get_pool()
     owner = await pool.get(f"ai_edit:owner:{job_id}")
@@ -696,3 +767,88 @@ async def ai_edit_status(
     if payload.get("status") in {"completed", "failed"}:
         payload["usage"] = await AIEditAllowanceService(db).summary(task["user_id"])
     return {"id": job_id, **payload}
+
+
+@router.get("/viral-audio/catalog")
+async def viral_audio_catalog():
+    from ...media.viral_audio import VIRAL_MUSIC_CATALOG, VIRAL_SFX_CATALOG
+
+    return {
+        "sfx": list(VIRAL_SFX_CATALOG.values()),
+        "music": list(VIRAL_MUSIC_CATALOG.values()),
+    }
+
+
+@router.get("/viral-audio/{kind}/{asset_id}")
+async def viral_audio_file(kind: str, asset_id: str):
+    from ...config import get_config
+    from ...media.viral_audio import ensure_music_file, ensure_sfx_file
+
+    temp_dir = get_config().temp_dir
+    if kind == "sfx":
+        path = await run_in_thread(ensure_sfx_file, asset_id, temp_dir)
+    elif kind == "music":
+        path = await run_in_thread(ensure_music_file, asset_id, temp_dir)
+    else:
+        raise HTTPException(404, "Audio asset not found")
+    if path is None or not path.is_file():
+        raise HTTPException(404, "Audio asset not found")
+    return FileResponse(
+        path,
+        media_type="audio/wav",
+        headers={"Cache-Control": "public, max-age=86400, immutable"},
+    )
+
+
+@router.post("/{task_id}/clips/{clip_id}/editor/viral")
+async def generate_viral_edit(
+    task_id: str, clip_id: str, request: Request, db: AsyncSession = Depends(get_db)
+):
+    """Run the multimodal Gameplay / TikTok Viral Director on a clip's editor draft."""
+    from ...services.viral_director_service import build_viral_tiktok_edit
+
+    payload = await _read_json_object(request)
+    _, clip, session = await owned_context(request, db, task_id, clip_id)
+    state = await session.state()
+    if state.get("status") != "ready":
+        raise HTTPException(409, "Wait for the editor preview to finish preparing")
+    raw_doc = payload.get("document") or state["draft"]["document"]
+    try:
+        document = EditDocument.model_validate(raw_doc).validate_duration(state["duration"])
+    except (ValueError, ValidationError) as exc:
+        raise HTTPException(400, str(exc))
+
+    mode = payload.get("mode") if payload.get("mode") in ("auto", "hybrid") else "auto"
+    vibe = payload.get("vibe") if payload.get("vibe") in ("zoeira", "clutch", "fail", "hype") else "zoeira"
+    split_cam = payload.get("splitCam") if isinstance(payload.get("splitCam"), bool) else None
+    cold_open = bool(payload.get("coldOpen", False))
+    explosion_cut = bool(payload.get("explosionCut", False))
+    use_gemini = bool(payload.get("useGemini", True))
+
+    clean_path = session.directory / "clean.mp4"
+    if not clean_path.is_file():
+        storage = MediaStorage()
+        if storage.enabled or storage.bucket:
+            try:
+                ref = storage.editor_reference(session.directory, "clean.mp4")
+                await run_in_thread(storage.download, ref, clean_path)
+            except Exception:
+                pass
+    if not clean_path.is_file():
+        clean_path = MediaStorage().local_path(clip["file_path"], metadata_only=True)
+
+    updated_doc, report = await build_viral_tiktok_edit(
+        clean_path,
+        document,
+        float(state["duration"]),
+        mode=mode,
+        vibe=vibe,
+        split_cam=split_cam,
+        cold_open=cold_open,
+        explosion_cut=explosion_cut,
+        use_gemini=use_gemini,
+    )
+    return {
+        "document": updated_doc.model_dump(),
+        "report": report,
+    }

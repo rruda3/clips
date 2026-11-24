@@ -2,13 +2,16 @@
 AI-related functions for transcript analysis with enhanced precision and virality scoring.
 """
 
+from collections import deque
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Literal
+from weakref import WeakKeyDictionary
 import asyncio
 import logging
 import math
 import random
 import re
+import time
 
 import httpx
 from pydantic_ai import Agent, NativeOutput
@@ -36,19 +39,21 @@ IDEAL_CLIP_MAX_SECONDS = 50
 MIN_ACCEPTED_CLIP_SECONDS = 15
 MAX_ACCEPTED_CLIP_SECONDS = 60
 TRANSCRIPT_ANALYSIS_CACHE_VERSION = "windowed-rerank-v6"
-TRANSCRIPT_ANALYSIS_MAX_ATTEMPTS = 3
-TRANSCRIPT_ANALYSIS_TIMEOUT_SECONDS = 600
+TRANSCRIPT_ANALYSIS_MAX_ATTEMPTS = 4
+TRANSCRIPT_ANALYSIS_TIMEOUT_SECONDS = 800
 # Long transcripts are analysed in overlapping windows so every part of the
 # source gets the model's full attention; candidates are then reranked together.
 ANALYSIS_WINDOW_SECONDS = 12 * 60
+ANALYSIS_LONG_SOURCE_THRESHOLD_SECONDS = 115 * 60
+ANALYSIS_LONG_SOURCE_WINDOW_SECONDS = 18 * 60
 ANALYSIS_WINDOW_OVERLAP_SECONDS = 2 * 60
 ANALYSIS_SINGLE_WINDOW_MAX_SECONDS = 15 * 60
 ANALYSIS_WINDOW_CONCURRENCY = 3
 ANALYSIS_WINDOW_SEGMENT_TARGET = "3-5"
 # Wall-clock budget for all windows together. Each window additionally keeps
 # its own TRANSCRIPT_ANALYSIS_TIMEOUT_SECONDS budget once it starts running.
-ANALYSIS_TOTAL_TIMEOUT_SECONDS = 1800
-RERANK_TIMEOUT_SECONDS = 240
+ANALYSIS_TOTAL_TIMEOUT_SECONDS = 3600
+RERANK_TIMEOUT_SECONDS = 360
 CANDIDATE_DEDUPE_OVERLAP_RATIO = 0.5
 # How far a model timestamp may sit from a transcript line boundary and still be
 # snapped onto it instead of the whole clip being dropped.
@@ -1126,6 +1131,98 @@ def _is_transient_model_error(error: Exception) -> bool:
     return False
 
 
+_LLM_RATE_WINDOW_SECONDS = 62.0
+_LLM_QUOTA_COOLDOWN_SECONDS = 65.0
+_llm_call_timestamps_by_model: Dict[str, deque[float]] = {}
+_llm_last_call_by_model: Dict[str, float] = {}
+_llm_cooldown_until: Dict[str, float] = {}
+_llm_rate_locks: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = WeakKeyDictionary()
+
+
+def _extract_http_status_code(error: BaseException) -> Optional[int]:
+    """Extract an HTTP status code from a direct or wrapped provider error."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status_code = getattr(current, "status_code", None)
+        if isinstance(status_code, int):
+            return status_code
+        current = current.__cause__
+    return None
+
+
+def _get_llm_rate_settings() -> tuple[int, float]:
+    """Read optional free-tier pacing limits from runtime config."""
+    try:
+        cfg = get_config()
+    except Exception:
+        return 0, 0.0
+    max_rpm = max(0, int(getattr(cfg, "llm_max_rpm", 0) or 0))
+    min_interval = max(0.0, float(getattr(cfg, "llm_min_interval_seconds", 0.0) or 0.0))
+    return max_rpm, min_interval
+
+
+def _get_llm_fallback_models() -> List[str]:
+    """Return configured fallback model names in priority order."""
+    try:
+        cfg = get_config()
+    except Exception:
+        return []
+    fallbacks = getattr(cfg, "llm_fallback_models", None) or []
+    return [str(m).strip() for m in fallbacks if str(m).strip()]
+
+
+def _primary_model_key(agent: Agent) -> str:
+    """Stable key for the agent's primary model in rate-limit/cooldown maps."""
+    model = getattr(agent, "model", None)
+    if isinstance(model, str):
+        return model
+    model_name = getattr(model, "model_name", None)
+    return str(model_name or "default")
+
+
+async def _acquire_llm_rate_slot(model_key: str) -> None:
+    """Space out LLM requests per model when free-tier RPM/interval pacing is set."""
+    max_rpm, min_interval = _get_llm_rate_settings()
+    if max_rpm <= 0 and min_interval <= 0.0:
+        return
+
+    loop = asyncio.get_running_loop()
+    lock = _llm_rate_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _llm_rate_locks[loop] = lock
+
+    async with lock:
+        timestamps = _llm_call_timestamps_by_model.setdefault(model_key, deque())
+        while True:
+            now = time.monotonic()
+            cutoff = now - _LLM_RATE_WINDOW_SECONDS
+            while timestamps and timestamps[0] <= cutoff:
+                timestamps.popleft()
+
+            last_call = _llm_last_call_by_model.get(model_key, 0.0)
+            wait_interval = (
+                max(0.0, (last_call + min_interval) - now)
+                if min_interval > 0.0 and last_call > 0.0
+                else 0.0
+            )
+            wait_rpm = (
+                max(0.0, (timestamps[0] + _LLM_RATE_WINDOW_SECONDS) - now)
+                if max_rpm > 0 and len(timestamps) >= max_rpm
+                else 0.0
+            )
+            delay = max(wait_interval, wait_rpm)
+            if delay <= 0.0:
+                _llm_last_call_by_model[model_key] = now
+                timestamps.append(now)
+                return
+
+            logger.info("Pacing %s call for %.1fs to stay within rate limits", model_key, delay)
+            await asyncio.sleep(delay)
+
+
 async def _run_transcript_analysis(
     agent: Agent,
     prompt: str,
@@ -1133,47 +1230,102 @@ async def _run_transcript_analysis(
 ) -> Any:
     """Retry temporary failures on the configured model within one overall budget.
 
-    Agent output retries handle schema repair, not HTTP failures. Retrying only
-    the model step preserves completed downloads and transcription. SDK retries
-    also count against the wall-clock budget, and cancellation passes through.
+    When ``LLM_FALLBACK_MODELS`` is configured and a model hits HTTP 429/404,
+    falls back immediately through the ordered fallback list before sleeping.
     """
     if timeout_seconds is None:
         timeout_seconds = TRANSCRIPT_ANALYSIS_TIMEOUT_SECONDS
+    primary_key = _primary_model_key(agent)
+    fallback_models = [m for m in _get_llm_fallback_models() if m != primary_key]
+    all_candidates: List[Optional[str]] = [None, *fallback_models]
+
     try:
         async with asyncio.timeout(timeout_seconds):
             for attempt in range(1, TRANSCRIPT_ANALYSIS_MAX_ATTEMPTS + 1):
-                try:
-                    result = await agent.run(prompt)
-                    if hasattr(result, "response"):
-                        logger.info("AI analysis completed using model %s", result.response.model_name)
-                    return result
-                except Exception as error:
-                    if not _is_transient_model_error(error):
-                        raise
-                    if attempt == TRANSCRIPT_ANALYSIS_MAX_ATTEMPTS:
-                        logger.error(
-                            "AI analysis unavailable after %s attempts (%s, HTTP status %s)",
-                            attempt,
-                            type(error).__name__,
-                            getattr(error, "status_code", None),
-                        )
-                        raise RuntimeError(
-                            "The AI analysis service is temporarily unavailable after "
-                            "several attempts. Please try again shortly."
-                        ) from None
+                now = time.monotonic()
+                candidates = [
+                    candidate
+                    for candidate in all_candidates
+                    if _llm_cooldown_until.get(candidate or primary_key, 0.0) <= now
+                ]
+                if not candidates:
+                    candidates = list(all_candidates)
 
-                    delay = 5 * 2 ** (attempt - 1) + random.uniform(0, 1)
-                    # Do not log provider bodies: they may contain transcript data.
-                    logger.warning(
-                        "Temporary AI analysis failure (%s, HTTP status %s); "
-                        "retrying attempt %s/%s in %.1fs",
-                        type(error).__name__,
-                        getattr(error, "status_code", None),
-                        attempt + 1,
-                        TRANSCRIPT_ANALYSIS_MAX_ATTEMPTS,
-                        delay,
+                last_error: Optional[Exception] = None
+                for idx, model_override in enumerate(candidates):
+                    rate_key = model_override or primary_key
+                    has_next_fallback = idx < len(candidates) - 1
+                    try:
+                        await _acquire_llm_rate_slot(rate_key)
+                        coro = (
+                            agent.run(prompt)
+                            if model_override is None
+                            else agent.run(prompt, model=model_override)
+                        )
+                        result = (
+                            await asyncio.wait_for(coro, timeout=min(45.0, float(timeout_seconds)))
+                            if has_next_fallback
+                            else await coro
+                        )
+                        if hasattr(result, "response"):
+                            logger.info("AI analysis completed using model %s", result.response.model_name)
+                        return result
+                    except Exception as error:
+                        status_code = _extract_http_status_code(error)
+                        is_model_timeout = isinstance(error, (asyncio.TimeoutError, TimeoutError))
+                        is_fallback_trigger = (
+                            status_code in (429, 404, 500, 502, 503, 504)
+                            or is_model_timeout
+                            or _is_transient_model_error(error)
+                        )
+                        if has_next_fallback and is_fallback_trigger:
+                            if status_code == 429:
+                                _llm_cooldown_until[rate_key] = time.monotonic() + _LLM_QUOTA_COOLDOWN_SECONDS
+                            elif status_code in (500, 502, 503, 504) or is_model_timeout:
+                                _llm_cooldown_until[rate_key] = time.monotonic() + 60.0
+                            next_label = candidates[idx + 1] or primary_key
+                            logger.warning(
+                                "Model %s returned %s; falling back immediately to %s",
+                                rate_key,
+                                f"HTTP {status_code}" if status_code else type(error).__name__,
+                                next_label,
+                            )
+                            last_error = error
+                            continue
+                        if not _is_transient_model_error(error) and not is_model_timeout:
+                            raise
+                        last_error = error
+                        break
+
+                assert last_error is not None
+                status_code = _extract_http_status_code(last_error)
+                if attempt == TRANSCRIPT_ANALYSIS_MAX_ATTEMPTS:
+                    logger.error(
+                        "AI analysis unavailable after %s attempts (%s, HTTP status %s)",
+                        attempt,
+                        type(last_error).__name__,
+                        status_code,
                     )
-                    await asyncio.sleep(delay)
+                    raise RuntimeError(
+                        "The AI analysis service is temporarily unavailable after "
+                        "several attempts. Please try again shortly."
+                    ) from None
+
+                if status_code == 429:
+                    delay = 61 + random.uniform(0, 3)
+                else:
+                    delay = 5 * 2 ** (attempt - 1) + random.uniform(0, 1)
+                # Do not log provider bodies: they may contain transcript data.
+                logger.warning(
+                    "Temporary AI analysis failure (%s, HTTP status %s); "
+                    "retrying attempt %s/%s in %.1fs",
+                    type(last_error).__name__,
+                    status_code,
+                    attempt + 1,
+                    TRANSCRIPT_ANALYSIS_MAX_ATTEMPTS,
+                    delay,
+                )
+                await asyncio.sleep(delay)
     except TimeoutError:
         logger.error("AI analysis exceeded the %ss time budget", timeout_seconds)
         raise RuntimeError(
@@ -1210,6 +1362,12 @@ def split_transcript_into_windows(
 
     if not timed_lines or total_seconds <= single_window_max_seconds:
         return [{"start": 0, "end": total_seconds, "transcript": transcript}]
+
+    if (
+        window_seconds == ANALYSIS_WINDOW_SECONDS
+        and total_seconds > ANALYSIS_LONG_SOURCE_THRESHOLD_SECONDS
+    ):
+        window_seconds = ANALYSIS_LONG_SOURCE_WINDOW_SECONDS
 
     step = max(1, window_seconds - overlap_seconds)
     bounds: List[List[int]] = []
@@ -1441,7 +1599,24 @@ async def _analyze_transcript_windows(
 
     Raises the first window error only when no window produced an analysis.
     """
-    semaphore = asyncio.Semaphore(ANALYSIS_WINDOW_CONCURRENCY)
+    try:
+        cfg = get_config()
+    except Exception:
+        cfg = None
+    concurrency = max(
+        1,
+        int(getattr(cfg, "analysis_window_concurrency", ANALYSIS_WINDOW_CONCURRENCY) or ANALYSIS_WINDOW_CONCURRENCY),
+    )
+    max_rpm, min_interval = _get_llm_rate_settings()
+    per_window_pace = max(
+        min_interval,
+        (_LLM_RATE_WINDOW_SECONDS / max_rpm) if max_rpm > 0 else 0.0,
+    )
+    total_timeout = max(
+        float(ANALYSIS_TOTAL_TIMEOUT_SECONDS),
+        len(windows) * (per_window_pace + 120.0),
+    )
+    semaphore = asyncio.Semaphore(concurrency)
 
     async def run_window(window: Dict[str, Any]) -> TranscriptAnalysis:
         async with semaphore:
@@ -1460,7 +1635,7 @@ async def _analyze_transcript_windows(
 
     tasks = [asyncio.create_task(run_window(window)) for window in windows]
     try:
-        _, pending = await asyncio.wait(tasks, timeout=ANALYSIS_TOTAL_TIMEOUT_SECONDS)
+        _, pending = await asyncio.wait(tasks, timeout=total_timeout)
     except asyncio.CancelledError:
         for task in tasks:
             task.cancel()
@@ -1691,7 +1866,20 @@ async def get_most_relevant_parts_by_transcript(
         agent = get_transcript_agent(clip_length)
         transcript_lines = _parse_transcript_lines(transcript)
         transcript_spans = _parse_transcript_spans(transcript)
-        windows = split_transcript_into_windows(transcript)
+        try:
+            cfg = get_config()
+        except Exception:
+            cfg = None
+        windows = split_transcript_into_windows(
+            transcript,
+            window_seconds=int(
+                getattr(cfg, "analysis_window_seconds", ANALYSIS_WINDOW_SECONDS) or ANALYSIS_WINDOW_SECONDS
+            ),
+            single_window_max_seconds=int(
+                getattr(cfg, "analysis_single_window_max_seconds", ANALYSIS_SINGLE_WINDOW_MAX_SECONDS)
+                or ANALYSIS_SINGLE_WINDOW_MAX_SECONDS
+            ),
+        )
 
         if len(windows) == 1:
             result = await _run_transcript_analysis(
@@ -1734,7 +1922,7 @@ async def get_most_relevant_parts_by_transcript(
         limit = max_final_clips_for_duration(source_seconds, get_config().max_clips)
         # Retain already-ranked alternatives until picture suitability checks
         # finish. No extra model call is needed when a slate is rejected.
-        validated_segments = candidates[: min(24, limit * 2) if include_reserve else limit]
+        validated_segments = candidates[: min(36, max(24, limit * 2)) if include_reserve else limit]
 
         final_analysis = TranscriptAnalysis(
             most_relevant_segments=validated_segments,

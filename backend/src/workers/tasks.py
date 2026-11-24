@@ -369,7 +369,7 @@ class WorkerSettings:
 
     # Retry settings
     max_tries = 3  # Retry failed jobs up to 3 times
-    job_timeout = 10800  # 3 hour timeout for video processing
+    job_timeout = 18000  # 5 hour timeout for long (3h+) video processing
 
     # Worker pool settings. Cron jobs live on CronWorkerSettings so they never
     # take one of these slots or pile up behind a long render.

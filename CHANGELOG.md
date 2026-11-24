@@ -4,6 +4,20 @@ What changed in SupoClip for people using the product. Newest dates are first.
 
 Add a line here when a pull request changes something a user can see. Use **New**, **Improved**, **Fixed**, or **Under the hood**, describe the change in plain language, and link the pull request. Skip internal-only work, or fold it into one **Under the hood** line. Do not include customer names, email addresses, user IDs, or anything else private.
 
+## 2026-11-21
+
+- **New:** Added a **Video Cache** tab in the sidebar (`/cache`) showing all cached YouTube and uploaded source videos with their disk sizes, letting you delete individual entries or clear unused cache to free storage space. ([#407](https://github.com/FujiwaraChoki/supoclip/pull/407))
+
+## 2026-11-20
+
+- **New:** TikTok Studio includes a visual quick-cut bar with interactive audio waveform scrubbing, one-click split, trim start/end, A→B middle-section removal, part deletion, and one-click switching back and forth with the full timeline editor while keeping your saved edits. ([#405](https://github.com/FujiwaraChoki/supoclip/pull/405))
+- **Improved:** TikTok Studio now shows a complete summary box of everything applied (format, layout, captions, cuts, background music, time/camera effects, subtexts, and SFX), stops audio immediately when clearing effects or removing music, and supports all viral effects across 9:16, 1:1, and 16:9 formats. ([#406](https://github.com/FujiwaraChoki/supoclip/pull/406))
+
+## 2026-11-18
+
+- **New:** TikTok Studio lets you open any video that already has clips and boost individual cuts for TikTok, Reels and Shorts in automatic 1-click mode or hybrid copilot mode—with split webcam + gameplay framing, black-and-white freeze-frame fail moments, explosion hard cuts, punch zooms, screen shake, comic subtexts, reaction sound effects and background music with auto-ducking. ([#404](https://github.com/FujiwaraChoki/supoclip/pull/404))
+- **Improved:** Gameplay mode on the create screen scans audio peaks, screams, explosions and visual motion so cuts capture the setup, chaos and reaction instead of relying on speech alone. ([#404](https://github.com/FujiwaraChoki/supoclip/pull/404))
+
 ## 2026-11-15
 
 - **New:** Settings → Agents & API shows how to connect Claude, ChatGPT or Grok: open the assistant's connector page, paste the SupoClip server URL and sign in. No key to copy. Each assistant lists which of its plans support this. Claude Code can sign in the same way. API keys moved into one tidy list with a Create key button; a new key opens with its Cursor and local config filled in. ([#403](https://github.com/FujiwaraChoki/supoclip/pull/403))

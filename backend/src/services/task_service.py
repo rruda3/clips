@@ -180,15 +180,21 @@ class TaskService(ClipEditingMixin):
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _build_analysis_cache_key(cache_key: str, clip_length: str = "auto") -> str:
-        """Row holding the analysis for a preset. Auto keeps the source row.
+    def _build_analysis_cache_key(
+        cache_key: str,
+        clip_length: str = "auto",
+        gameplay_mode: bool = False,
+    ) -> str:
+        """Row holding the analysis for a preset/mode. Auto non-gameplay keeps the source row.
 
         The source and transcript do not depend on the preset, so other presets
-        store only their analysis under a derived key and share the rest.
+        (or Gameplay Mode) store only their analysis under a derived key and share the rest.
         """
-        if validate_clip_length(clip_length) == "auto":
+        if not gameplay_mode and validate_clip_length(clip_length) == "auto":
             return cache_key
         payload = f"{cache_key}|length:{clip_length}"
+        if gameplay_mode:
+            payload += "|gameplay:1"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
@@ -209,6 +215,8 @@ class TaskService(ClipEditingMixin):
         payload = f"{cache_key}|wf:{spec.fingerprint()}|llm:{config.llm}|{config.rerank_llm}"
         if spec.workflow == "topic":
             payload += f"|cap:{int(config.workflow_topic_max_clips)}"
+        if (cleanup_settings or {}).get("gameplay_mode"):
+            payload += "|gameplay:1"
         if spec.workflow != "highlights":
             lengths = cleanup_key(normalize_clip_cleanup_settings(**(cleanup_settings or {})))
             if lengths is not None:
@@ -541,8 +549,11 @@ class TaskService(ClipEditingMixin):
             cache_key = self._build_cache_key(
                 url, source_type, processing_mode, download_quality
             )
+            is_gameplay_mode = bool((cleanup_settings or {}).get("gameplay_mode"))
             if spec.legacy:
-                analysis_cache_key = self._build_analysis_cache_key(cache_key, clip_length)
+                analysis_cache_key = self._build_analysis_cache_key(
+                    cache_key, clip_length, gameplay_mode=is_gameplay_mode
+                )
             else:
                 analysis_cache_key = self._build_workflow_cache_key(
                     cache_key, spec, self.config, cleanup_settings
@@ -650,6 +661,8 @@ class TaskService(ClipEditingMixin):
                     "outline_cache_key": outline_cache_key,
                     "cleanup_settings": normalized_cleanup_settings,
                 }
+            elif normalized_cleanup_settings.get("gameplay_mode"):
+                workflow_kwargs = {"cleanup_settings": normalized_cleanup_settings}
 
             pipeline_start = perf_counter()
             result = await self.video_service.process_video_complete(
@@ -726,6 +739,26 @@ class TaskService(ClipEditingMixin):
                 )
 
             video_path = Path(result["video_path"])
+            if (
+                normalized_cleanup_settings.get("gameplay_mode")
+                and output_format == "vertical"
+                and not normalized_cleanup_settings.get("resolved_webcam_box")
+                and video_path.is_file()
+            ):
+                try:
+                    from ..media.gameplay_signals import detect_gameplay_webcam_box_smart
+
+                    hint = normalized_cleanup_settings.get("webcam_position") or "auto"
+                    src_dur = float(task_row.get("source_duration_seconds") or 0)
+                    resolved_wb = await run_in_thread(
+                        detect_gameplay_webcam_box_smart, video_path, src_dur, hint
+                    )
+                    normalized_cleanup_settings["resolved_webcam_box"] = resolved_wb
+                    existing_meta = await self.task_repo.load_source_metadata(self.db, task_id)
+                    existing_meta["resolved_webcam_box"] = resolved_wb
+                    await self.task_repo.save_source_metadata(self.db, task_id, existing_meta)
+                except Exception as exc:
+                    logger.warning("Gameplay webcam locator skipped: %s", exc)
             time_map = await run_in_thread(load_time_map, video_path)
             total_clips = len(segments_to_render)
             clips_output_dir = Path(self.config.temp_dir) / "clips"
